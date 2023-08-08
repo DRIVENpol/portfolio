@@ -5,7 +5,7 @@ pragma solidity 0.8.17;
 interface IToken {
     function balanceOf(address account) external view returns (uint256);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
-    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 value) external returns (bool);
 }
 
 contract MultiSig {
@@ -187,8 +187,7 @@ contract MultiSig {
     }
 
     function transferErc20(IToken _tokenAddress, uint256 _amount, address _to) internal {
-        _tokenAddress.approve(_to, _amount);
-        require(_tokenAddress.transferFrom(address(this), _to, _amount), "Transfer Failed!");
+        require(_tokenAddress.transfer(_to, _amount), "Transfer Failed!");
     
         emit Erc20Transfer(address(_tokenAddress), _amount, _to);
     }
