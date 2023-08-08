@@ -19,7 +19,13 @@ interface IToken {
     function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
 }
 
-contract FlightClubSubscription is ERC721, Ownable {
+/**
+ * @title NFT Subscription
+ * @author Socarde Paul
+ * @notice Receive a subscription NFT on the first payment
+ */
+
+contract NftSubscription is ERC721, Ownable {
 
     /** VARIABLES */
     uint256 private id; // Current NFT Id
