@@ -3,7 +3,7 @@
 
 /// @title Vesting for ERC20 tokens
 /// @notice Custom made smart contract to create a vesting schedule for investors
-/// @author Vigilantia Operational
+/// @author Socarde Paul
 
 
 /// Solidity version
