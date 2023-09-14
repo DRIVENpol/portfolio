@@ -1,26 +1,10 @@
-/**
- * @title Reward Pools
- * @notice Receive interestae rate for each reward pool that is added based on
- *         your share of main pool
- * @author Socarde Paul
-*/
+// SPDX-License-Identifier: MIT
 
-//SPDX-License-Identifier: MIT
-
-/**
- * Solidity version
- */
 pragma solidity ^0.8.0;
 
-/**
- * Local imports
- */
-import "./Ownable.sol";
-import "./Reentrancy-Guard.sol";
+import "../../lib/openzeppelin-contracts/contracts/access/Ownable.sol";
+import "../../lib/openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
 
-/**
- * Interfaces
- */
 interface IToken {
     function balanceOf(
         address account
@@ -72,899 +56,905 @@ interface IFactory {
 }
 
 contract StakingPackages is Ownable, ReentrancyGuard {
-    /** Total staked amount */
-    uint256 public totalPool;
 
-    /** Total rewards in tokens */
-    uint256 public rewardPool;
+    uint256 public idMainPool;
+    uint256 public totalStakedInPool;
+    uint256 public totalGivenRewards;
+    uint256 public totalUniqueStakers;
 
-    /** Fees & Fee Managements */
     uint256 public entryFee;
     uint256 public exitFee;
-    uint256 public totalFees;
+    uint256 public totalCollectedFees;
     uint256 public threshold;
 
-    uint256[] public feeAllocation;
+    uint256[] public feeAllocations;
     address[] public feeReceivers;
 
-    /** Router */
-    address public router;
-    address public factory;
-    address public wbnb;
+    address public router = 0xD99D1c33F9fC3444f8101754aBC46c52416550D1; // Testnet
+    address public factory = 0x46E9aD48575d08072E9A05a9BDE4F22973628A8E; // Testnet
+    address public wbnb =  0xae13d989daC2f0dEbFf460aC112a837C89BAa7cd; // Testnet
     address public busd;
 
-    address private zeroAddress = address(0);
-    address private deadAddress = 0x000000000000000000000000000000000000dEaD;
+    address public immutable zeroAddress = address(0);
+    address public immutable deadAddress = 0x000000000000000000000000000000000000dEaD;
 
-
-    /** Main pool */
-    uint256 public idMainPool;
     bool public mainPoolExist;
-    /**
-     * We assign an id to 'idMainPool' if
-     * a pool with main token is created
-     */
+    bool public generalPause;
 
-    /** Staking token */
     IToken public stakingToken;
 
-    /** Struct for reward pools */
     struct RewardPool {
-        uint256 totalRewards;
         uint256 startDate;
         uint256 endDate;
         uint256 duration;
-        address rewardToken;
+        uint256 totalClaimedRewards;
+        uint256 totalAllocatedRewards;
+        address token;
         bool enable;
+        bool tokenHaveLiquditity;
     }
 
-    /** Array of reward pools */
+    struct User {
+        uint256 totalStaked;
+        mapping(uint256 => uint256) rewardsClaimedInPool;
+        mapping(uint256 => uint256) lastClaimInPool;
+        mapping(uint256 => uint256) claimedDaysInPool;
+    }
+
     RewardPool[] public rewardPools;
 
-    /** Mappings */
-    mapping(address => bool) public haveLiquidity;
-    mapping(uint256 => uint256) public claimedInPool;
-    mapping(address => uint256) public totalStakedByUser;
-    mapping(address => uint256) public usersRewardsInAllPools;
-    mapping(address => mapping(uint256 => bool)) public claimedAllInPool;
-    mapping(address => mapping(uint256 => uint256)) public lastClaimInPool;
-    mapping(address => mapping(uint256 => uint256)) public claimedDaysInPool;
+    mapping(address => User) public users;
+    mapping(address => uint256) public tokenToIndex;
+    mapping(address => bool) public isTokenAdded;
 
+    constructor(
+        address _stakingToken
+    ) {
+        require(_validAddress(_stakingToken), "Staking: stakingToken must be valid address");
+
+        stakingToken = IToken(_stakingToken);
+    }
 
     /** Events */
-    event RedistributeFees();
-    event SetStatusForPool(
-        uint256 id,
-        bool status
+    event PoolAdded(
+        uint256 indexed poolIndex,
+        uint256 startDate,
+        uint256 endDate,
+        uint256 duration,
+        uint256 totalClaimedRewards,
+        uint256 totalAllocatedRewards,
+        address token,
+        bool enable,
+        bool tokenHaveLiquditity
+    );
+    event PoolModified(
+        uint256 indexed poolIndex,
+        uint256 startDate,
+        uint256 endDate,
+        uint256 duration,
+        uint256 totalClaimedRewards,
+        uint256 totalAllocatedRewards,
+        address token,
+        bool enable,
+        bool tokenHaveLiquditity
+    );
+    event TogglePauseUpdate();
+    event ChangeFees(
+        uint256 entryFee,
+        uint256 exitFee,
+        uint256 threshold
+    );
+    event AddFeeAllocation(
+        uint256 feeAllocation,
+        address feeReceiver
+    );
+    event RemoveFeeAllocation(
+        uint256 index
+    );
+    event ChangeRouterAndFactory(
+        address router,
+        address factory
+    );
+    event ChangeWbnbAndBusd(
+        address wbnb,
+        address busd
+    );
+    event ChangeStakingToken(
+        address stakingToken
     );
     event Stake(
-        address indexed user,
+        address user,
         uint256 amount
-    );
-    event SetFees(
-        address[] receivers,
-        uint256[] fees
     );
     event Unstake(
-        address indexed user,
+        address user,
         uint256 amount
     );
-    event ClaimRewards(
-        address indexed user,
-        uint256 rewards,
-        uint256 id
+    event RedistributeFees(
+        uint256 amount
     );
-    event AddPool(
-        address indexed rToken,
-        uint256 rAmount,
-        uint256 duration
+    event IncreaseRewardsInPool(
+        uint256 amount
     );
-    event CompoundRewards(
-        address indexed user,
-        uint256 rewards,
-        uint256 id
-    );
-    event AddRewardsInPool(
-        uint256 amount,
-        uint256 poolId
-    );
-    event ProlongTimeInPool(
-        uint256 timeInDays,
-        uint256 poolId
+    event ChangePoolStatus(
+        uint256 poolIndex,
+        bool status
     );
 
-    /** 
-     * @dev The constructor
-     * @param _stakingToken The address of the token that will be staked
-     * @param _router The address of PancakeSwap router
-     */
-    constructor(
-        address _stakingToken,
-        address _router
-    ) {
-        stakingToken = IToken(_stakingToken);
-        router = _router;
-    }
+    /** External functions */
 
     /**
-     * @dev Function to add a new pool
-     * @notice If the rewardToken = main token
-     *         we set the value of 'mainPollExist' to true
-     *         and we asign the id of the pool to 'idMainPool'
-     * @param rewardToken The token used for rewards
-     * @param rewardAmount The amount that will be distirbuted to stakers
-     * @param duration The duration of the pool
-     * @param liquid If the token have liquidity on an exchange or not
+        * @dev Add new pool
+        * @param duration Duration of pool
+        * @param totalAllocatedRewards Total allocated rewards for pool
+        * @param token Token for rewards
+        * @param increaseAmount Increase amount of pool (yes/no)
+        * @param increaseDuration Increase duration of pool (yes/no)
      */
     function addPool(
-        address rewardToken,
-        uint256 rewardAmount,
         uint256 duration,
-        bool liquid
-    ) 
+        uint256 totalAllocatedRewards,
+        address token,
+        bool increaseAmount,
+        bool increaseDuration
+    )
         external
         onlyOwner 
     {
-        require(
-            IToken(rewardToken).transferFrom(msg.sender, address(this), rewardAmount),
-            "Can't add rewards!"
+        // require(duration > 0, "Staking: duration must be greater than 0");
+        // require(totalAllocatedRewards > 0, "Staking: totalAllocatedRewards must be greater than 0");
+        require(_validAddress(token), "Staking: token must be valid address");
+
+        if(isTokenAdded[token]) {
+            if(increaseAmount && totalAllocatedRewards > 0) {
+                rewardPools[tokenToIndex[token]].totalAllocatedRewards += totalAllocatedRewards;
+
+                require(
+                    IToken(token).transferFrom(
+                        msg.sender,
+                        address(this),
+                        totalAllocatedRewards
+                    ),
+                    "Staking: transferFrom failed"
+                );
+            } else if(!increaseAmount && totalAllocatedRewards > 0){
+                require(
+                    rewardPools[tokenToIndex[token]].totalAllocatedRewards - totalAllocatedRewards > 0,
+                    "Staking: totalAllocatedRewards must be greater than 0"
+                );
+
+                rewardPools[tokenToIndex[token]].totalAllocatedRewards -= totalAllocatedRewards;
+
+                require(
+                    IToken(token).transfer(
+                        msg.sender,
+                        totalAllocatedRewards
+                    ),
+                    "Staking: transfer failed"
+                );
+            }
+
+            if(increaseDuration && duration > 0) {
+                rewardPools[tokenToIndex[token]].duration += duration;
+                rewardPools[tokenToIndex[token]].endDate += (duration * 1 days);
+            } else if(!increaseDuration && duration > 0) {
+                require(
+                    rewardPools[tokenToIndex[token]].endDate - duration * 1 days > rewardPools[tokenToIndex[token]].startDate,
+                    "Staking: duration must be greater than startDate"
+                );
+
+                rewardPools[tokenToIndex[token]].endDate -= (duration * 1 days);
+                rewardPools[tokenToIndex[token]].duration -= duration;
+            }
+
+            emit PoolModified(
+                tokenToIndex[token],
+                rewardPools[tokenToIndex[token]].startDate,
+                rewardPools[tokenToIndex[token]].endDate,
+                rewardPools[tokenToIndex[token]].duration,
+                rewardPools[tokenToIndex[token]].totalClaimedRewards,
+                rewardPools[tokenToIndex[token]].totalAllocatedRewards,
+                rewardPools[tokenToIndex[token]].token,
+                rewardPools[tokenToIndex[token]].enable,
+                rewardPools[tokenToIndex[token]].tokenHaveLiquditity
             );
 
-        if (rewardToken == address(stakingToken)) {
-            idMainPool = rewardPools.length;
-            mainPoolExist = true;
+            return;
         }
 
-        uint256 _duration = duration * 1 days;
-        uint256 _startDate = block.timestamp;
-        uint256 _endDate = block.timestamp + _duration;
-
-        if(liquid) {
-            haveLiquidity[rewardToken] = true;
-        }
-
-        RewardPool memory _pool = RewardPool(
-            rewardAmount,
-            _startDate,
-            _endDate,
-            _duration,
-            rewardToken,
-            true
+        require(
+            IToken(token).transferFrom(
+                msg.sender,
+                address(this),
+                totalAllocatedRewards
+            ),
+            "Staking: transferFrom failed"
         );
 
-        rewardPools.push(_pool);
-        emit AddPool(rewardToken, rewardAmount, duration);
+        uint256 index = rewardPools.length;
+
+        if(address(stakingToken) == token) {
+            idMainPool = index;
+        }
+
+        bool haveLiquidity = _checkLiquidity(token) != zeroAddress;
+
+        rewardPools.push(RewardPool({
+            startDate: block.timestamp,
+            endDate: block.timestamp + (duration * 1 days),
+            duration: duration,
+            totalClaimedRewards: 0,
+            totalAllocatedRewards: totalAllocatedRewards,
+            token: token,
+            enable: true,
+            tokenHaveLiquditity: haveLiquidity
+        }));
+
+        tokenToIndex[token] = index;
+        isTokenAdded[token] = true;
+
+        emit PoolAdded(
+            index,
+            block.timestamp,
+            block.timestamp + duration * 1 days,
+            duration,
+            0,
+            totalAllocatedRewards,
+            token,
+            true,
+            haveLiquidity
+        );
     }
 
     /**
-     * @dev Function to add more rewards in a pool
-     * @param amount Amount to add for rewards
-     * @param poolId For which pool do we want to increase the reward amount
+        * @dev Withdraw ERC20 tokens
+        * @param tokenAddress Address of token
      */
-    function addRewards(
-        uint256 amount,
-        uint256 poolId
+    function withdrawERC20Tokens(
+        address tokenAddress
+    )
+        external
+        onlyOwner
+    {
+        uint256 amount = IToken(tokenAddress).balanceOf(address(this));
+
+        require(
+            IToken(tokenAddress).transfer(msg.sender, amount),
+            "Can't withdraw tokens!"
+        );
+    }
+
+    /**
+        * @dev Pause/unpause
+     */
+    function togglePause() external onlyOwner {
+        generalPause = !generalPause;
+
+        emit TogglePauseUpdate();
+    }
+
+    /**
+        * @dev Toggle pool pause
+        * @param _poolIndex Index of pool
+     */
+    function togglePoolPause(
+        uint256 _poolIndex
+    )
+        external
+        onlyOwner
+    {
+        require(_poolIndex < rewardPools.length, "Staking: _poolIndex must be less than rewardPools length");
+
+        rewardPools[_poolIndex].enable = !rewardPools[_poolIndex].enable;
+
+        emit ChangePoolStatus(
+            _poolIndex,
+            rewardPools[_poolIndex].enable
+        );
+    }
+
+    /**
+        * @dev Change fees
+        * @param _entryFee Entry fee
+        * @param _exitFee Exit fee
+        * @param _threshold Threshold
+     */
+    function changeFees(
+        uint256 _entryFee,
+        uint256 _exitFee,
+        uint256 _threshold
     )
     external
-    onlyOwner
-    {
-        require(
-            poolId < rewardPools.length,
-            "Non-existent pool!"
+    onlyOwner {
+        require(_entryFee >= 0 && _entryFee <= 100, "Staking: entryFee must be between 0 and 100");
+        require(_exitFee >= 0 && _exitFee <= 100, "Staking: exitFee must be between 0 and 100");
+        require(_threshold > 0, "Staking: threshold must be greater than 0");
+
+        entryFee = _entryFee;
+        exitFee = _exitFee;
+        threshold = _threshold;
+
+        emit ChangeFees(
+            _entryFee,
+            _exitFee,
+            _threshold
         );
-
-        RewardPool storage _pool = rewardPools[poolId];
-
-        require(
-            IToken(_pool.rewardToken).transferFrom(msg.sender, address(this), amount),
-            "Can't add rewards!"
-            );
-
-        unchecked {
-            _pool.totalRewards += amount;
-        }
-
-        emit AddRewardsInPool(amount, poolId);
     }
 
     /**
-     * @dev Function to extend the end date for a pool
-     * @param timeInDays How many days do we want to add
+        * @dev Add fee allocation
+        * @param _feeAllocation Fee allocation amount
+        * @param _feeReceiver Fee receiver address
      */
-    function extendRewardPool(
-        uint256 timeInDays,
-        uint256 poolId
+    function addFeeAllocation(
+        uint256 _feeAllocation,
+        address _feeReceiver
     )
-    external
-    onlyOwner
-    {
-        require(
-            poolId < rewardPools.length,
-            "Non-existent pool!"
-        );
-
-        RewardPool storage _pool = rewardPools[poolId];
-
-        uint256 _timeInDays = timeInDays * 1 days;
-        uint256 currentEndDate = _pool.endDate;
-
-        if(block.timestamp < currentEndDate) {
-            unchecked {
-                _pool.endDate += _timeInDays;
-            }
-        } else if (block.timestamp >= currentEndDate) {
-            unchecked {
-                 _pool.endDate = block.timestamp + _timeInDays;
-            }
-        }
-
-        emit ProlongTimeInPool(timeInDays, poolId);
-    }
-
-    /**
-     * @dev Function to reduce the time of a pool
-     */
-    function reduceTimeOfPool(
-        uint256 timeInDays,
-        uint256 poolId
-    )
-    external 
-    onlyOwner 
-    {
-        require(
-            poolId < rewardPools.length,
-            "Non-existent pool!"
-        );
-
-        RewardPool storage _pool = rewardPools[poolId];
-
-        uint256 _timeToCut = timeInDays * 1 days;
-        
-        require(
-            _pool.endDate - _timeToCut > block.timestamp,
-            "Can't cut that much!"
-        );
-
-        _pool.endDate -= _timeToCut;
-    }
-
-    /**
-     * @dev Function to reduce the rewards in a pool
-     */
-    function reduceRewardsOfPool(
-        uint256 rewardsToCut,
-        uint256 poolId
-    )
-    external 
-    onlyOwner 
-    {
-        require(
-            poolId < rewardPools.length,
-            "Non-existent pool!"
-        );
-
-        RewardPool storage _pool = rewardPools[poolId];
-
-        require(
-            _pool.totalRewards - rewardsToCut > 0,
-            "Can't cut that much!"
-        );
-
-        _pool.totalRewards -= rewardsToCut;
-    }
-
-    /**
-     * @dev Function to disable/enable a pool
-     * @param id Which pool to disable
-     * @param status What status do we want to set
-     */
-    function setStatusForPool(
-        uint256 id,
-        bool status
-    ) 
         external
         onlyOwner 
     {
-        require(
-            id < rewardPools.length,
-            "Invalid pool!"
-            );
+        require(_feeAllocation > 0 && _feeAllocation <= 100, "Staking: feeAllocation must be between 0 and 100");
+        require(_validAddress(_feeReceiver), "Staking: feeReceiver must be valid address");
 
-        RewardPool storage _pool = rewardPools[id];
+        feeAllocations.push(_feeAllocation);
+        feeReceivers.push(_feeReceiver);
 
-        require(
-            _pool.enable != status,
-            "Status in use!"
-            );
-
-        _pool.enable = status;
-
-        emit SetStatusForPool(id, status);
+        emit AddFeeAllocation(
+            _feeAllocation,
+            _feeReceiver
+        );
     }
 
     /**
-     * @dev Function to set fees & fee receivers
+        * @dev Remove fee allocation
+        * @param _index Index of fee allocation
      */
-    function setFees(
-        address[] calldata _feeReceivers,
-        uint256[] calldata _fees
-        ) 
+    function removeFeeAllocation(
+        uint256 _index
+    )
         external
         onlyOwner 
     {
-        require(
-            _feeReceivers.length == _fees.length,
-            "Invalid amounths!"
-            );
+        require(_index < feeAllocations.length, "Staking: index must be less than feeAllocations length");
 
-        uint256 _totalFees;
+        feeAllocations[_index] = feeAllocations[feeAllocations.length - 1];
+        feeAllocations.pop();
 
-        for (uint256 i = 0; i < _fees.length;) {
-            _totalFees += _fees[i];
-            unchecked {
-                ++i;
-            }
-        }
+        feeReceivers[_index] = feeReceivers[feeReceivers.length - 1];
+        feeReceivers.pop();
 
-        require(
-            _totalFees <= 100,
-            "Invalid fee alocation!"
-            );
-
-        for (uint256 i = 0; i < _fees.length;) {
-            feeAllocation[i] = _fees[i];
-            feeReceivers[i] = _feeReceivers[i];
-            unchecked {
-                ++i;
-            }
-        }
-
-        emit SetFees(_feeReceivers, _fees);
+        emit RemoveFeeAllocation(
+            _index
+        );
     }
 
     /**
-     * @dev Function to change the address of staking token
+        * @dev Change router and factory
+        * @param _router Router address
+        * @param _factory Factory address
+     */
+    function changeRouterAndFactory(
+        address _router,
+        address _factory
+    )
+        external
+        onlyOwner 
+    {
+        require(_validAddress(_router), "Staking: router must be valid address");
+        require(_validAddress(_factory), "Staking: factory must be valid address");
+
+        router = _router;
+        factory = _factory;
+
+        emit ChangeRouterAndFactory(
+            _router,
+            _factory
+        );
+    }
+
+    /**
+        * @dev Change wbnb and busd
+        * @param _wbnb WBNB address
+        * @param _busd BUSD address
+     */
+    function changeWBNBandBUSD(
+        address _wbnb,
+        address _busd
+    )
+        external
+        onlyOwner 
+    {
+        require(_validAddress(_wbnb), "Staking: wbnb must be valid address");
+        require(_validAddress(_busd), "Staking: busd must be valid address");
+
+        wbnb = _wbnb;
+        busd = _busd;
+
+        emit ChangeWbnbAndBusd(
+            _wbnb,
+            _busd
+        );
+    }
+
+    /**
+        * @dev Change staking token
+        * @param _stakingToken Staking token address
      */
     function changeStakingToken(
-        address newStakingToken
+        address _stakingToken
     )
-    external 
-    onlyOwner 
+        external
+        onlyOwner 
     {
-        require(
-            newStakingToken != zeroAddress &&
-            newStakingToken != deadAddress,
-            "Invalid address!"
+        require(_validAddress(_stakingToken), "Staking: stakingToken must be valid address");
+
+        stakingToken = IToken(_stakingToken);
+
+        emit ChangeStakingToken(
+            _stakingToken
         );
-        
-        stakingToken = IToken(newStakingToken);
     }
 
     /**
-     * @dev Function to change the router address
+        * @dev Stake
+        * @param amount Amount to stake
      */
-    function changeRouter(
-        address newRouter
-    )
-    external 
-    onlyOwner 
-    {
+    function stake(uint256 amount) external nonReentrant() {
         require(
-            newRouter != zeroAddress &&
-            newRouter != deadAddress,
-            "Invalid address!"
+            stakingToken.transferFrom(
+                msg.sender,
+                address(this),
+                amount
+            ),
+            "Staking: transferFrom failed"
         );
-
-        router = newRouter;
-    }
-
-    /**
-     * @dev Function to change the factory address
-     */
-    function changeFactory(
-        address newFactory
-    )
-    external 
-    onlyOwner 
-    {
-        require(
-            newFactory != zeroAddress &&
-            newFactory != deadAddress,
-            "Invalid address!"
-        );
-
-        router = newFactory;
-    }
     
-    /**
-     * @dev Function to stake main token
-     * @param amount Amount to stake
-     */
-    function stake(
-        uint256 amount
-    ) 
-        external 
-        nonReentrant 
-    {
-        require(
-            stakingToken.transferFrom(msg.sender, address(this), amount), 
-            "Can't stake tokens!"
-            );
-
-        unchecked {
-            totalStakedByUser[msg.sender] += amount;
-            totalPool += amount;
+        if(users[msg.sender].totalStaked == 0) {
+            totalUniqueStakers++;
         }
 
-        usersRewardsInAllPools[msg.sender] = _computeShareOfThePool(msg.sender);
+        users[msg.sender].totalStaked += amount;
+        totalStakedInPool += amount;
 
         uint256 _fee = amount * entryFee / 100;
+        totalCollectedFees += _fee;
 
-        unchecked {
-            totalFees += _fee;
-        }
+        _redistributeFees();
 
-        _checkAndSendFees();
-
-        emit Stake(msg.sender, amount);
+        emit Stake(
+            msg.sender,
+            amount
+        );
     }
 
     /**
-     * @dev Function to unstake tokens
-     * @param amount The amount that we want to unstake
+        * @dev Unstake
+        * @param amount Amount to unstake
      */
-    function unstake(
-        uint256 amount
-    ) 
-        external
-        nonReentrant 
-    {
-        require(
-            amount <= totalStakedByUser[msg.sender],
-            "Can't unstake that much!"
-            );
-        
-        totalStakedByUser[msg.sender] -= amount;
-        totalPool -= amount;
+    function unstake(uint256 amount) external nonReentrant() {
+        require(generalPause == false, "Staking: generalPause must be false");
+        require(users[msg.sender].totalStaked >= amount, "Staking: amount must be less than totalStaked");
 
-        // Take the fee
+        users[msg.sender].totalStaked -= amount;
+        totalStakedInPool -= amount;
+
         uint256 _fee = amount * exitFee / 100;
-        unchecked {
-            totalFees += _fee;
-        }
+        totalCollectedFees += _fee;
 
-        _checkAndSendFees();
+        _redistributeFees();
 
         require(
-            stakingToken.transfer(msg.sender, amount - _fee),
-            "Can't unstake!"
-            );
+            stakingToken.transfer(
+                msg.sender,
+                amount - _fee
+            ),
+            "Staking: transfer failed"
+        );
 
-         emit Unstake(msg.sender, amount);
+        emit Unstake(
+            msg.sender,
+            amount
+        );
     }
 
-    /**
-     * @dev Function to claim all rewards from each pool
-     */
-    function claimAll() 
-    external 
-    {
-        for (uint256 i = 0; i < rewardPools.length;) {
-            claimRewards(i);
-            unchecked {
-                ++i;
-            }
-        }
-    }
+    /** Public functions */
 
     /**
-     * @dev Function to compound all rewards from each pool
-     */
-    function compoundAll() 
-        external 
-    {
-        for (uint256 i = 0; i < rewardPools.length;) {
-            compoundRewards(i);
-            unchecked {
-                ++i;
-            }
-        }
-    }
-
-    /**
-     * @dev Function to fetch the length of the packages array
-     */
-    function getNoOfPackages() 
-        external 
-        view 
-        returns (uint256) 
-    {
-        return rewardPools.length;
-    }
-    /**
-     * @dev Function to display the tokens claimed in a pool
-     */
-    function getClaimedInPool(
-        uint256 poolId
-    )
-    external
-    view
-    returns (uint256) {
-        return claimedInPool[poolId];
-    }
-
-    /**
-     * @dev Function to fetch the ids of active packages
-     */
-    function getActivePackages() external view returns (uint256[] memory) {
-        uint256[] memory ids = new uint256[](rewardPools.length);
-        uint256 index;
-
-        for (uint256 i = 0; i < rewardPools.length; i++) {
-            if (rewardPools[i].enable) {
-                ids[index] = i;
-
-                unchecked {
-                    ++index;
-                }
-            }
-        }
-
-        assembly {
-            mstore(ids, index)
-        }
-
-        return ids;
-    }
-
-    /**
-     * @dev Function to fetch the details of a package
-     */
-    function getDetailsOfPackage(
-        uint256 packageId
-    ) 
-        external 
-        view 
-        returns(RewardPool memory) 
-    {
-        return rewardPools[packageId];
-    }
-
-    /**
-     * @dev Function to claim rewards from one reward pool
-     * @param rewardPoolId From which pool do we want to claim the rewards
+        * @dev Claim rewards
+        * @param _poolIndex Index of pool from which to claim rewards
      */
     function claimRewards(
-        uint256 rewardPoolId
-    ) 
-        public 
-        nonReentrant
+        uint256 _poolIndex
+    )
+        public
     {
-        require(
-            rewardPoolId < rewardPools.length,
-            "Invalid pool!"
-            );
+        require(generalPause == false, "Staking: generalPause must be false");
 
-        uint256 _lastClaim = lastClaimInPool[msg.sender][rewardPoolId];
+        require(_poolIndex < rewardPools.length, "Staking: _poolIndex must be less than rewardPools length");
+
+        RewardPool memory _pool = rewardPools[_poolIndex];
+        User storage _user = users[msg.sender];
+
+        require(_user.totalStaked > 0, "Staking: totalStaked must be greater than 0");
         
-        if (
-            claimedAllInPool[msg.sender][rewardPoolId] == true || 
-            rewardPools[rewardPoolId].enable == false ||
-            block.timestamp >= _lastClaim + 1 days
-            ) 
-        {
+        if(_pool.enable == false) {
             return;
         }
 
-        uint256 _rewards = computeRewards(msg.sender, rewardPoolId);
+        if(_user.lastClaimInPool[_poolIndex] + 1 days > block.timestamp) {
+            return;
+        }
 
-        if (_rewards == 0) {
+        _user.lastClaimInPool[_poolIndex] = block.timestamp;
+
+        (
+            uint256 _toReceive,
+            uint256 _claimedDays
+        ) = computePendingRewards(msg.sender, _poolIndex);
+
+        if(_toReceive == 0) {
+            return;
+        }
+
+        if(_user.claimedDaysInPool[_poolIndex] + _claimedDays > _pool.duration) {
             return;
         }
 
         require(
-            stakingToken.transfer(msg.sender, _rewards),
-            "Can't claim rewards!"
-            );
-        unchecked {
-            claimedInPool[rewardPoolId] += _rewards;
-        }
-
-        emit ClaimRewards(msg.sender, _rewards, rewardPoolId);
+            stakingToken.transfer(
+                msg.sender,
+                _toReceive
+            ),
+            "Staking: transfer failed"
+        );
     }
 
     /**
-     * @dev Function to compound rewards from one reward pool
-     * @param rewardPoolId From which pool do we want to claim the rewards
+        * @dev Claim all rewards
+     */
+    function claimAll() public {
+        require(generalPause == false, "Staking: generalPause must be false");
+
+        for(uint256 i = 0; i < rewardPools.length; i++) {
+            if(rewardPools[i].enable) {
+                claimRewards(i);
+            }
+        }
+    }
+
+    /**
+        * @dev Compound rewards
+        * @param _poolIndex Index of pool from which to compound rewards
      */
     function compoundRewards(
-        uint256 rewardPoolId
+        uint256 _poolIndex
     )
         public
-        nonReentrant 
     {
-        require(
-            rewardPoolId < rewardPools.length,
-            "Invalid pool!"
-            );
+        require(generalPause == false, "Staking: generalPause must be false");
+        require(_poolIndex < rewardPools.length, "Staking: _poolIndex must be less than rewardPools length");
 
-        uint256 _lastClaim = lastClaimInPool[msg.sender][rewardPoolId];
+        RewardPool memory _pool = rewardPools[_poolIndex];
+        User storage _user = users[msg.sender];
 
-        require(
-            block.timestamp >= _lastClaim + 1 days,
-            "Wait 24h before you claim!"
-            );
+        require(_user.totalStaked > 0, "Staking: totalStaked must be greater than 0");
 
-        if(!haveLiquidity[rewardPools[rewardPoolId].rewardToken]) {
+        if(_pool.tokenHaveLiquditity == false) {
             return;
         }
 
-        address _liquidityToken = _checkLiquidity(rewardPools[rewardPoolId].rewardToken);
-
-        if(_liquidityToken == address(0)) {
+        if(_user.claimedDaysInPool[_poolIndex] == _pool.duration) {
             return;
         }
-        
-        if (claimedAllInPool[msg.sender][rewardPoolId] == true || 
-        rewardPools[rewardPoolId].enable == false) {
+
+        if(_pool.enable == false) {
             return;
         }
-        uint256 _rewards = computeRewards(msg.sender, rewardPoolId);
-        // Swap the rewards for main token
-        uint256 _balanceBefore = stakingToken.balanceOf(address(this));
-        swapTokensForMainToken(_rewards, rewardPools[rewardPoolId].rewardToken, _liquidityToken);
-        uint256 _balanceAfter = stakingToken.balanceOf(address(this));
-        // Re-stake the rewards
-        uint256 _toRestake = _balanceBefore - _balanceAfter;
-        rewardPools[rewardPoolId].totalRewards += _toRestake;
 
-        unchecked {
-            totalStakedByUser[msg.sender] += _toRestake;
-            totalPool += _toRestake;
+        if(_user.lastClaimInPool[_poolIndex] + 1 days > block.timestamp) {
+            return;
         }
 
-        emit CompoundRewards(msg.sender, _rewards, rewardPoolId);
+        address _middleToken = _checkLiquidity(_pool.token);
+        address _liqMainToken = _checkLiquidity(address(stakingToken));
+
+        if(_middleToken == zeroAddress && _liqMainToken == zeroAddress) {
+            return;
+        }
+
+        (
+            uint256 _toReceive,
+            uint256 _claimedDays
+        ) = computePendingRewards(msg.sender, _poolIndex);
+
+        if(_toReceive == 0) {
+            return;
+        }
+
+        if(_user.claimedDaysInPool[_poolIndex] + _claimedDays > _pool.duration) {
+            return;
+        }
+
+        _user.rewardsClaimedInPool[_poolIndex] += _toReceive / 10_000;
+        _user.lastClaimInPool[_poolIndex] = block.timestamp;
+        _user.claimedDaysInPool[_poolIndex] += _claimedDays;
+
+        uint256 _toAdd = _swapTokenForStakingToken(_pool.token, _middleToken, _liqMainToken, msg.sender, _toReceive / 10_000);
+    
+        _user.totalStaked += _toAdd;
     }
 
     /**
-     * @dev Function to compute the share of the pool for user
-     * @param user For which EOA do we want to compute the shares of the pool
+        * @dev Compound all rewards
      */
-    function _computeShareOfThePool(
-        address user
-    ) 
-        public 
-        view 
-        returns (uint256) 
-    {
-        return (totalStakedByUser[user] * 100) / totalPool;
-    }
+    function compoundAll() public {
+        require(generalPause == false, "Staking: generalPause must be false");
 
-    /**
-     * @dev Function to swap the rewards for main token
-     */
-    function swapTokensForMainToken(
-        uint256 tokenAmount,
-        address fromToken,
-        address middleToken
-        ) 
-        internal 
-    {
-
-        address _liquidityForMainToken = _checkLiquidity(address(stakingToken));
-
-        if(_liquidityForMainToken == middleToken) {
-            address[] memory path = new address[](3);
-            path[0] = fromToken;
-            path[1] = middleToken;
-            path[2] = address(stakingToken);
-
-            IToken(fromToken).approve(router, tokenAmount);
-
-            IRouter(router).swapExactTokensForTokensSupportingFeeOnTransferTokens(
-                tokenAmount,
-                0,
-                path,
-                address(this),
-                block.timestamp
-            );
-        } else if(_liquidityForMainToken != middleToken) {
-            address[] memory path = new address[](4);
-            path[0] = fromToken;
-            path[1] = middleToken;
-            path[2] = _liquidityForMainToken
-            path[3] = address(stakingToken);
-
-            IToken(fromToken).approve(router, tokenAmount);
-
-            IRouter(router).swapExactTokensForTokensSupportingFeeOnTransferTokens(
-                tokenAmount,
-                0,
-                path,
-                address(this),
-                block.timestamp
-            );  
+        for(uint256 i = 0; i < rewardPools.length; i++) {
+            if(rewardPools[i].enable) {
+                compoundRewards(i);
+            }
         }
     }
 
     /**
-     * @dev Function to compute the rewards
+        * @dev Get number of packages
      */
-    function computeRewards(
-        address user,
-        uint256 rewardPoolId
+    function getNoOfPackages() public view returns (uint256) {
+        return rewardPools.length;
+    }
+
+    /**
+        * @dev Get ids of active packages
+     */
+    function getIdsOfActivePackages() public view returns (uint256[] memory) {
+        uint256[] memory _ids = new uint256[](rewardPools.length);
+        uint256 _counter = 0;
+
+        for(uint256 i = 0; i < rewardPools.length; i++) {
+            if(rewardPools[i].enable) {
+                _ids[_counter] = i;
+                _counter++;
+            }
+        }
+
+        uint256[] memory _activeIds = new uint256[](_counter);
+
+        for(uint256 i = 0; i < _counter; i++) {
+            _activeIds[i] = _ids[i];
+        }
+
+        return _activeIds;
+    }
+
+    /**
+        * @dev Get fees for stake and unstake
+     */
+    function getFees() public view returns (uint256, uint256) {
+        return (entryFee, exitFee);
+    }
+
+    /**
+        * @dev Get general share of user
+     */
+    function getGeneralShare(address _user) public view returns (uint256) {
+        return _sharOfUser(_user);
+    }
+
+    /**
+        * @dev Get staked amount by user
+     */
+    function getStakedByUser(address _user) public view returns (uint256) {
+        return users[_user].totalStaked;
+    }
+
+    /**
+        * @dev Can claim from pool or not
+     */
+    function getPoolHaveLiquditiy(address _token) public view returns (bool) {
+        return rewardPools[tokenToIndex[_token]].tokenHaveLiquditity;
+    }
+
+    /**
+        * @dev Get user details for pool
+     */
+    function getUserDetailsForPool(address _user, uint256 _poolIndex) public view returns (uint256, uint256, uint256) {
+        return (
+            users[_user].rewardsClaimedInPool[_poolIndex],
+            users[_user].lastClaimInPool[_poolIndex],
+            users[_user].claimedDaysInPool[_poolIndex]
+        );
+    }
+
+    /**
+        * @dev Get pool details
+     */
+    function getPoolDetails(uint256 _poolIndex) public view 
+    returns (
+        uint256, 
+        uint256, 
+        uint256, 
+        uint256, 
+        uint256,
+        address,
+        bool, 
+        bool) 
+        {
+            RewardPool memory _pool = rewardPools[_poolIndex];
+
+            return (
+                _pool.startDate,
+                _pool.endDate,
+                _pool.duration,
+                _pool.totalClaimedRewards,
+                _pool.totalAllocatedRewards,
+                _pool.token,
+                _pool.enable,
+                _pool.tokenHaveLiquditity
+            );
+    }
+
+    /**
+        * @dev Get pending rewards for user in pool
+     */
+    function computePendingRewards(
+        address _user,
+        uint256 _poolIndex
     ) 
         public
-        returns(uint256) 
+        view
+        returns (uint256, uint256)
     {
-       RewardPool storage _pool = rewardPools[rewardPoolId];
+        uint256 _share = _sharOfUser(_user);
 
-       uint256 _shareOfPool = _computeShareOfThePool(user);
-
-        uint256 _toClaim = _shareOfPool * _pool.totalRewards / 100;
-        uint256 _toClaimPerDay = _toClaim / _pool.duration;
-
-        // Get claimed day by user in that pool
-        uint256 _claimedDays = claimedDaysInPool[user][rewardPoolId];
-
-        if (block.timestamp >= _pool.endDate) {
-            uint256 _deltaClaimed = _pool.duration - _claimedDays;
-            uint256 _rewards = _deltaClaimed * _toClaimPerDay;
-
-            require(
-                claimedDaysInPool[user][rewardPoolId] + _deltaClaimed <= _pool.duration, 
-                "Can't claim anymore!"
-                );
-
-            _pool.totalRewards -= _rewards;
-
-            unchecked {
-                claimedDaysInPool[user][rewardPoolId] += _deltaClaimed;
-            }
-
-            claimedAllInPool[user][rewardPoolId] = true;
-
-            return _rewards;
-        } else {
-            uint256 _timeElapsed = block.timestamp - _pool.startDate;
-            uint256 _timeElapsedInDays = _timeElapsed / 86400;
-            uint256 _rewards = _timeElapsedInDays * _toClaimPerDay;
-
-            require(
-                claimedDaysInPool[user][rewardPoolId] + _timeElapsedInDays <= _pool.duration, 
-                "Can't claim anymore!"
-                );
-
-            require(
-                stakingToken.transfer(user, _rewards),
-                "Can't send rewards!"
-                );
-
-            _pool.totalRewards -= _rewards;
-
-            unchecked {
-                claimedDaysInPool[user][rewardPoolId] += _timeElapsedInDays;
-            }
-            if (claimedDaysInPool[user][rewardPoolId] + _timeElapsedInDays == _pool.duration) {
-                claimedAllInPool[user][rewardPoolId] = true;
-            }
-
-            return _rewards;
+        if (_share == 0) {
+            return (0, 0);
         }
+
+        RewardPool memory _pool = rewardPools[_poolIndex];
+        User storage _userStorage = users[_user];
+
+        uint256 _totalRewardsToReceive = _pool.totalAllocatedRewards * _share / 100;
+        uint256 _rewardsToReceivePerDay = _totalRewardsToReceive / _pool.duration;
+
+        if(_rewardsToReceivePerDay == 0) {
+            return (0, 0);
+        }
+
+        // Case 1: Pool ended
+        if (block.timestamp > _pool.endDate) {
+            uint256 _claimedRewards = _userStorage.rewardsClaimedInPool[_poolIndex];
+            // Pool duration - claimed days
+            uint256 _daysSinceLastClaim = _pool.duration - _userStorage.claimedDaysInPool[_poolIndex];
+            return (_totalRewardsToReceive / 10_000 - _claimedRewards, _daysSinceLastClaim);
+        }
+
+        // Case 2: Pool not ended
+        if(block.timestamp <= _pool.endDate) {
+            // Days since last claim until now
+            uint256 _daysSinceLastClaim = (block.timestamp - _userStorage.lastClaimInPool[_poolIndex]) / 1 days;
+            return (_rewardsToReceivePerDay * _daysSinceLastClaim / 10_000, _daysSinceLastClaim);
+        }
+
+        return (0, 0);
     }
 
-    /**
-     * @dev Function to check if we reached the threshold
-     * @notice If yes, we distribute the rewards
-     */
-    function _checkAndSendFees() 
-        internal 
-    {
-        if (totalFees >= threshold) {
-            _redistributeFees();
-
-        } else {
-            return;
-        }
+    /** Internal functions */
+    function _sharOfUser(address _user) internal view returns (uint256) {
+        return users[_user].totalStaked * 100 * 10_000 / totalStakedInPool;
     }
 
-    /**
-     * @dev Function to redistribute the fees
-     * @return true After execution
-     */
-    function _redistributeFees() 
-        internal 
-        returns (bool)
-    {
-       if(feeReceivers.length == 0) {
-        return false;
-       }
-
-       for (uint256 i = 0; i < feeReceivers.length;) {
-        uint256 _fee = feeAllocation[i];
-        uint256 _feeAmount = totalFees * _fee / 100;
-
-        if (feeReceivers[i] == address(this)) {
-            require(
-                _increaseRewardPool(_feeAmount),
-                "Can't increase the reward pool!"
-                );
-
-        } else {
-            require(
-                stakingToken.transfer(feeReceivers[i], _feeAmount),
-                "Can't send fees!"
-                );
-
-        }
-        unchecked {
-            ++i;
-        }
-       }
-
-       uint256 _delta = totalFees - threshold;
-       if (_delta > 0) {
-        totalFees = _delta;
-       } else {
-        totalFees = 0;
-       }
-
-    emit RedistributeFees();
-
-    return true;
+    function _validAddress(address _address) internal view returns (bool) {
+        return _address != zeroAddress && _address != deadAddress;
     }
 
-    /**
-     * @dev Function to increase the reward pool
-     * @param amount The amount that will be added in the
-     *               reward pool
-     * @return true After execution
-     */
-    function _increaseRewardPool(
-        uint256 amount
-    ) 
-        internal 
-        returns (bool) 
-    {
-        rewardPool += amount;
-
-        if (mainPoolExist) {
-            RewardPool storage _pool = rewardPools[idMainPool];
-            _pool.totalRewards += rewardPool;
-            rewardPool = 0;
+    function _checkLiquidity(address _token) internal view returns (address) {
+        address _pairWithWbnb = IFactory(factory).getPair(_token, wbnb);
+        if (_pairWithWbnb != address(0)) {
+            return _pairWithWbnb;
         }
 
-        return true;
+        address _pairWithBusd = IFactory(factory).getPair(_token, busd);
+        if (_pairWithBusd != address(0)) {
+            return _pairWithBusd;
+        }
+
+        return address(0);
     }
 
-    /**
-     * @dev Function to check if there is liquidity for a token
-     *      before swapping it
-     * @param tokenToCheck The token that we are checking
-     */
-    function _checkLiquidity(
-        address tokenToCheck
-    )
-    internal
-    view
-    returns (address)
-    {
-        IFactory _factory = IFactory(factory);
-        address _pair0 = _factory.getPair(tokenToCheck, wbnb);
-        address _pair1 = _factory.getPair(tokenToCheck, busd);
-
+    function _redistributeFees() internal {
         if(
-            _pair0 != address(0) &&
-            IToken(wbnb).balanceOf(_pair0 ) > 0
+            totalCollectedFees == 0 ||
+            totalCollectedFees <= threshold ||
+            feeAllocations.length == 0   
         ) {
-           return wbnb;
-        } else if(
-            _pair1 != address(0) &&
-            IToken(busd).balanceOf(_pair0 ) > 0
-        ) {
-            return busd;
-        } else {
-            return address(0);
+            return;
         }
+
+        uint256 _totalCollectedFees = totalCollectedFees;
+        totalCollectedFees = 0;
+
+        for(uint256 i = 0; i < feeAllocations.length; i++) {
+            uint256 _fee = _totalCollectedFees * feeAllocations[i] / 100;
+
+            if(_fee == 0) {
+                continue;
+            }
+
+            if(feeReceivers[i] == zeroAddress) {
+                continue;
+            }
+
+            if(feeReceivers[i] == address(this)){
+                _increaseRewardsInPool(_fee);
+                continue;
+            }
+
+            require(
+                stakingToken.transfer(
+                    feeReceivers[i],
+                    _fee
+                ),
+                "Staking: transfer failed"
+            );
+        }
+
+        emit RedistributeFees(
+            _totalCollectedFees
+        );
+    }
+
+    function _increaseRewardsInPool(uint256 _amount) internal {
+        if(mainPoolExist) {
+            rewardPools[idMainPool].totalAllocatedRewards += _amount;
+
+            emit IncreaseRewardsInPool(
+                _amount
+            );
+        } else {
+            return;
+        }
+    }
+
+    function _swapTokenForStakingToken(
+        address _token,
+        address _middleToken,
+        address _liqMainToken,
+        address _receiver,
+        uint256 _amount
+    )
+        internal
+        returns(uint256)
+    {
+        address[] memory _path;
+
+        if(_middleToken == _liqMainToken) {
+            _path = new address[](2);
+            _path[0] = _token;
+            _path[1] = address(stakingToken);
+        } else {
+            _path = new address[](4);
+            _path[0] = _token;
+            _path[1] = _middleToken;
+            _path[2] = _liqMainToken;
+            _path[3] = address(stakingToken);
+        }
+
+
+        IToken(_token).approve(router, _amount);
+
+        uint256 _balanceBefore = stakingToken.balanceOf(address(this));
+
+        IRouter(router).swapExactTokensForTokensSupportingFeeOnTransferTokens(
+            _amount,
+            0,
+            _path,
+            _receiver,
+            block.timestamp + 360
+        );
+
+        uint256 _balanceAfter = stakingToken.balanceOf(address(this));
+
+        return _balanceAfter - _balanceBefore;
     }
 }
