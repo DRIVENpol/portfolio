@@ -103,21 +103,12 @@ contract Migrator {
 
     /// Function for dev to allow people to withdraw new amounts
     function toggleWithdraw() external isAdmin {
-        if(canWithdraw) {
-            canWithdraw = false;
-        } else {
-            canWithdraw = true;
-        }
-        
+        canWithdraw = !canWithdraw;
     }
 
     /// Function for dev to allow people to deposit old amounts
     function toggleDeposit() external isAdmin {
-       if(canDeposit) {
-        canDeposit = false;
-       } else {
-        canDeposit = true;
-       }
+        canDeposit = !canDeposit;
     }
 
     /// Function for dev to withdraw all new tokens
@@ -170,31 +161,23 @@ contract Migrator {
        if(IERC20(tokenA).transfer(where, IERC20(tokenA).balanceOf(address(this))) != true) revert Issue();
     }
 
-    /// Internal function to compute the new amount
     function _computeNewAmount(address holder, uint256 amount) internal {
         uint8 _d1 = IERC20(tokenA).decimals();
         uint8 _d2 = IERC20(tokenB).decimals();
 
-        uint256 _finalAmount = amount;
+        uint256 _adjustedDifference = (_d1 > _d2) ? 10 ** (_d1 - _d2) : 10 ** (_d2 - _d1);
+        uint256 _finalAmount = (_d1 != _d2) ? amount / _adjustedDifference : amount;
 
-        if(_d1 > _d2) {
-             _finalAmount = amount / 10 ** (_d1 - _d2);
-        } else if(_d1 == _d2) {
-             _finalAmount = amount;
-        } else if(_d1 < _d2) {
-             _finalAmount = amount / 10 ** (_d2 - _d1);
+        if (doOperations == 1) {
+            _finalAmount *= denominator;
+        } else if (doOperations == 2) {
+            _finalAmount /= denominator;
         }
 
-        if(doOperations == 0) {
-            holderToNewAmount[holder] =  _finalAmount;
-        } else if(doOperations == 1) {
-            holderToNewAmount[holder] =  _finalAmount * denominator;
-        } else if(doOperations == 2) {
-            holderToNewAmount[holder] =  _finalAmount / denominator;
-        }
+        holderToNewAmount[holder] = _finalAmount;
 
         unchecked {
-            tokensSent += holderToNewAmount[holder];
+            tokensSent += _finalAmount;
         }
     }
 

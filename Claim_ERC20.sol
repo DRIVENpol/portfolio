@@ -51,11 +51,7 @@ contract ClaimFactory is Ownable {
 
     // Toggle function for "isPaused" variable
     function togglePause() external onlyOwner {
-        if(pauseCreation == true) {
-            pauseCreation = false;
-        } else {
-            pauseCreation = true;
-        }
+        pauseCreation = !pauseCreation;
     }
 
     function setFee(uint256 _newFee) external onlyOwner {
@@ -121,20 +117,20 @@ contract ClaimErc20 is Ownable, ReentrancyGuard {
         uint256 _totalTokens = totalTokens;
         totalUsers += _to.length;
 
-        for (uint256 i = 0; i < _to.length; i++) {
+        for (uint256 i = 0; i < _to.length;) {
             amountByAddressERC20[_to[i]] = _amounts[i];
             _totalTokens += _amounts[i];
+
+            unchecked {
+                ++i
+            }
         }
         totalTokens = _totalTokens;
     }
 
     // Toggle function for "isPaused" variable
     function togglePaused() external onlyOwner {
-        if(isPaused == true) {
-            isPaused = false;
-        } else {
-            isPaused == true;
-        }
+        isPaused = !isPaused;
     }
 
      // Claim ERC20 tokens
@@ -145,9 +141,11 @@ contract ClaimErc20 is Ownable, ReentrancyGuard {
         require(_amount <= tokenToAirdrop.balanceOf(address(this)), "Not enough tokens for this action!");
         // require(msg.sender == _to || msg.sender == addressToApprover[_to], "You don't have the right to do that!");
 
-        amountByAddressERC20[_to] -= _amount;
-        totalClaimed += _amount;
-        usersClaimed++;
+        unchecked {
+            amountByAddressERC20[_to] -= _amount;
+            totalClaimed += _amount;
+            ++usersClaimed;
+        }
 
        require(tokenToAirdrop.transfer(_to, _amount), "Failing to transfer ERC20 tokens!");
 
@@ -225,11 +223,7 @@ contract ClaimEther is Ownable, ReentrancyGuard {
 
     // Toggle function for "isPaused" variable
     function togglePaused() external onlyOwner {
-        if(isPaused == true) {
-            isPaused = false;
-        } else {
-            isPaused == true;
-        }
+        isPaused = !isPaused;
     }
 
     // Set the amounts that needs to be claimed by each address - ETH
@@ -239,9 +233,13 @@ contract ClaimEther is Ownable, ReentrancyGuard {
         uint256 _totalTokens = totalTokens;
         totalUsers += _to.length;
 
-        for (uint256 i = 0; i < _to.length; i++) {
+        for (uint256 i = 0; i < _to.length;) {
             amountByAddressETH[_to[i]] = _amounts[i];
             _totalTokens += _amounts[i];
+
+            unchecked {
+                ++i;
+            }
         }
 
         totalTokens = _totalTokens;
@@ -254,9 +252,11 @@ contract ClaimEther is Ownable, ReentrancyGuard {
         require(_amount <= amountByAddressETH[_to], "You are trying to claim too many tokens!");
         require(_amount <= address(this).balance, "Not enough tokens for this action!");
 
-        amountByAddressETH[_to] -= _amount;
-        totalClaimed += _amount;
-        usersClaimed++;
+        unchecked {
+            amountByAddressETH[_to] -= _amount;
+            totalClaimed += _amount;
+            usersClaimed++;            
+        }
 
         (bool sent, ) = _to.call{value: _amount}("");
         require(sent, "Transaction failed!");
