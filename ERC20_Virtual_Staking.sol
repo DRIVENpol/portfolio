@@ -247,10 +247,10 @@ contract VIRTUAL_STAKING_TOKEN is ERC20, Ownable, ReentrancyGuard {
         bool _isBlockedFrom = isBlocked[from];
         bool _isBlockedTo = isBlocked[to];
 
-        if(isDex[from] == false && isDex[to] == false) {
+        if(isDex[from] == false || isDex[to] == false) {
         // // Compute the difference
         uint256 _theDifference = getAvailableBalanceForTransfer(from);
-        require(amount <= _theDifference, "You can't transfer this amount because you have staked tokens!");
+        require(amount < _theDifference, "You can't transfer this amount because you have staked tokens!");
         }
       
          if(_isBlockedFrom == true || _isBlockedTo == true) {
@@ -344,7 +344,7 @@ contract VIRTUAL_STAKING_TOKEN is ERC20, Ownable, ReentrancyGuard {
         IERC20 _tokenToWitdhraw = IERC20(_whatToken);
 
         // Transfer the tokens to the owner of the smart contract
-        _tokenToWitdhraw.transfer(owner(), _amount);
+        require(_tokenToWitdhraw.transfer(owner(), _amount), "Can't transfer tokens!");
     }
 
     // Getters -------------------------------------

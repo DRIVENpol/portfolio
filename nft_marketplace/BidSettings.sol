@@ -112,11 +112,7 @@ contract BidSettings is Initializable, OwnableUpgradeable, ReentrancyGuardUpgrad
 
     /** EXTERNAL FUNCTIONS */
     function togglePause() external onlyOwner {
-        if(paused) {
-            paused = false;
-        } else {
-            paused = true;
-        }
+        paused = !paused;
     }
 
     /**
@@ -186,7 +182,7 @@ contract BidSettings is Initializable, OwnableUpgradeable, ReentrancyGuardUpgrad
         );
 
         require(
-            msg.value > bid,
+            msg.value >= bid,
             "BidSettings::Can't send the bid!"
         );
 

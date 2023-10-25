@@ -81,8 +81,8 @@ contract LockerV3 is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         __Ownable_init();
         __UUPSUpgradeable_init();
 
-        lockFee = 1 * 10 ** 18;
-        extendLockFee = 1 * 10 ** 17;
+        lockFee = 1 ether;
+        extendLockFee = 1 ether;
     }
 
     /// Authorize upgrade (UUPS specific)
@@ -109,7 +109,7 @@ contract LockerV3 is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         /// The caller can't use his own address as refferal
         if(refferal == msg.sender) revert Issue();
 
-        /// Token address should not be zer0
+        /// Token address should not be zero
         if(tokenAddress == address(0)) revert Issue();
 
         /// The amount to lock should not be zero
