@@ -1,9 +1,10 @@
+
 // SPDX-License-Identifier: MIT
 
 pragma solidity ^0.8.0;
 
 /**
- * @author Socarde Paul
+ * @author Rev3al LLC
  * @title NFT Marketplace Smart Contract
  */
 
@@ -18,8 +19,34 @@ interface IERC721 {
     function ownerOf(uint256 tokenId) external view returns (address owner);
     function transferFrom(address from, address to, uint256 tokenId) external;
 }
+interface IERC2981 {
+    /// @notice Called with the sale price to determine how much royalty
+    //          is owed and to whom.
+    /// @param _tokenId - the NFT asset queried for royalty information
+    /// @param _salePrice - the sale price of the NFT asset specified by _tokenId
+    /// @return receiver - address of who should be sent the royalty payment
+    /// @return royaltyAmount - the royalty payment amount for _salePrice
+    function royaltyInfo(
+        uint256 _tokenId,
+        uint256 _salePrice
+    ) external view returns (
+        address receiver,
+        uint256 royaltyAmount
+    );
+}
+interface IERC165 {
+    /**
+     * @dev Returns true if this contract implements the interface defined by
+     * `interfaceId`. See the corresponding
+     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]
+     * to learn more about how these ids are created.
+     *
+     * This function call must use less than 30 000 gas.
+     */
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
 
-contract NFT_MarketPlace is Initializable, OwnableUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgradeable {
+contract MarketPlace is Initializable, OwnableUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgradeable {
 
     /** UINT */
     uint256 public totalItemsSold;
@@ -27,8 +54,15 @@ contract NFT_MarketPlace is Initializable, OwnableUpgradeable, ReentrancyGuardUp
     /** ADDRESS */
     address public bidSettings;
 
+    /** Royalty interface */
+    bytes4 private constant _INTERFACE_ID_ERC2981 = 0x2a55205a;
+
     /** BOOL */
     bool private paused;
+
+    uint8 private constant OPEN_FOR_BIDS_FLAG = 1 << 0; // 00000001
+    uint8 private constant CLOSED_FLAG = 1 << 1; // 00000010
+    uint8 private constant SOLD_FLAG = 1 << 2; // 00000100
 
     /** STRUCT */
     struct MarketItem {
@@ -37,9 +71,10 @@ contract NFT_MarketPlace is Initializable, OwnableUpgradeable, ReentrancyGuardUp
         uint256 bidEndDate;
         address seller;
         address collection;
-        bool openForBids;
-        bool closed;
-        bool sold;
+        // bool openForBids;
+        // bool closed;
+        // bool sold;
+        uint8 flags;
     }
 
     /** Array of market items */
@@ -48,6 +83,14 @@ contract NFT_MarketPlace is Initializable, OwnableUpgradeable, ReentrancyGuardUp
     /** MAPPINGS */
     mapping(address => uint256[]) public myListedItems; // Address -> Market item ids
     mapping(address => uint256[]) public collectionItems; // Address -> Market item ids
+
+    /** CUSTOM ERRORS */
+    error InvalidMarketItem(uint256 id);
+    error NotBidSettings(address caller);
+    error ContractIsPaused(bool paused);
+    error NotValidAddress(address addr);
+    error NotEnoughFunds(uint256 amount);
+
 
     /** EVENTS */
     event ListNft(
@@ -65,6 +108,10 @@ contract NFT_MarketPlace is Initializable, OwnableUpgradeable, ReentrancyGuardUp
         uint256 id,
         uint256 extendPeriodInDays
     );
+    event ChangePrice(
+        uint256 id, 
+        uint256 newPrice
+    );
     event BuyMarketItem(
         uint256 id
     );
@@ -79,20 +126,24 @@ contract NFT_MarketPlace is Initializable, OwnableUpgradeable, ReentrancyGuardUp
     );
 
     /** MODIFIERS */
+    /** 
+     * @dev Throws if called by any account other than the 'bidSettings' smart contract.
+     */
     modifier onlyBidSettings() {
-        require(
-            msg.sender == bidSettings,
-            "Marketplace::Not bidSettings!"
-        );
+        if(msg.sender != bidSettings) {
+            revert NotBidSettings(msg.sender);
+        }
 
         _;
     }
 
+    /**
+     * @dev Throws if the contract is paused.
+     */
     modifier isPaused() {
-        require(
-            !paused,
-            "Marketplace::Contract is paused!"
-        );
+        if(paused) {
+            revert ContractIsPaused(paused);
+        }
 
         _;
     }
@@ -106,7 +157,7 @@ contract NFT_MarketPlace is Initializable, OwnableUpgradeable, ReentrancyGuardUp
     function initialize(
         address _bidSettings
     ) initializer public {
-        __Ownable_init();
+        __Ownable_init(msg.sender);
         __UUPSUpgradeable_init();
         __ReentrancyGuard_init();
 
@@ -125,11 +176,7 @@ contract NFT_MarketPlace is Initializable, OwnableUpgradeable, ReentrancyGuardUp
      * @dev Function to pause/unpause the smart contract
      */
     function togglePause() external onlyOwner {
-        if(paused) {
-            paused = false;
-        } else {
-            paused = true;
-        }
+        paused = !paused;
     }
 
     /**
@@ -143,6 +190,10 @@ contract NFT_MarketPlace is Initializable, OwnableUpgradeable, ReentrancyGuardUp
     external
     onlyOwner
     {
+        if(_validateAddress(_newBidSettings) == false) {
+            revert NotValidAddress(_newBidSettings);
+        }
+
         bidSettings = _newBidSettings;
     }
 
@@ -173,9 +224,11 @@ contract NFT_MarketPlace is Initializable, OwnableUpgradeable, ReentrancyGuardUp
         );
 
         uint256 _bidEndDate;
+        uint8 _flags = 0;
 
-        if(openForBids) {
+        if (openForBids) {
             _bidEndDate = block.timestamp + (bidEndDate * 1 days);
+            _flags |= OPEN_FOR_BIDS_FLAG;
         }
         
         myListedItems[msg.sender].push(marketItems.length);
@@ -188,166 +241,167 @@ contract NFT_MarketPlace is Initializable, OwnableUpgradeable, ReentrancyGuardUp
                 _bidEndDate,
                 msg.sender, 
                 collection, 
-                openForBids,
-                false, 
-                false
-                )
+                _flags
+            )
         );
 
         emit ListNft(id, price, bidEndDate, collection, openForBids);
     }
 
+
     /**
      * @dev Function to buy a market item (NFT).
      * @param id The id of the market item.
      */
-    function buyMarketItem(
-        uint256 id
-    )
-    external
-    payable
-    nonReentrant
-    isPaused
+    function buyMarketItem(uint256 id) 
+        external 
+        payable 
+        nonReentrant 
+        isPaused 
     {
-        require(
-            id < marketItems.length,
-            "Marketplace::Not a market item!"
-        );
 
         MarketItem storage _item = marketItems[id];
 
-        require(
-            !_item.sold,
-            "Marketplace::Item already sold!"
-        );
+        bool _valid = _validateLength(id) &&
+            _validateSold(_item.flags) &&
+            _validateClosed(_item.flags) &&
+            !_validateOpenForBids(_item.flags);
 
-        require(
-            !_item.openForBids,
-            "Marketplace::This item is on auction!"
-        );
+        if(_valid == false) {
+            revert InvalidMarketItem(id);
+        }
 
-        require(
-            !_item.closed,
-            "Marketplace::Not for sale anymore!"
-        );
+        if(msg.value < _item.price) {
+            revert NotEnoughFunds(_item.price);
+        }
 
-        require(
-            msg.value >= _item.price,
-            "Marketplace::Please pay for your NFT!"
-        );
-
-        _item.sold = true;
+        _item.flags |= SOLD_FLAG;
 
         IERC721(_item.collection).transferFrom(
             address(this),
             msg.sender,
-            id
+            _item.nftId 
         );
 
-        safeSendPayment(
-            _item.price,
-            _item.seller
-        );
+        if(_checkRoyalties(_item.collection) == false) {
+            _safeSendPayment(
+                _item.price,
+                _item.seller
+            );
 
-        unchecked {
-            ++totalItemsSold;
+            unchecked {
+                ++totalItemsSold;
+            }
+
+            emit BuyMarketItem(id);
+
+            return;
+        } else {
+            (address _royaltyReceiver, uint256 _royaltyAmount) = IERC2981(_item.collection).royaltyInfo(
+                _item.nftId,
+                _item.price
+            );
+
+            _safeSendPayment(
+                _royaltyAmount,
+                _royaltyReceiver
+            );
+
+            _safeSendPayment(
+                _item.price - _royaltyAmount,
+                _item.seller
+            );
+
+            unchecked {
+                ++totalItemsSold;
+            }
+
+            emit BuyMarketItem(id);
+
+            return;
         }
-
-        emit BuyMarketItem(id);
     }
 
     /**
      * @dev Function to withdraw an item (NFT) from the market.
      * @param id The id of the market item.
      */
-    function closeMarketItem(
-        uint256 id
-    )
-    external
-    nonReentrant
-    isPaused
+    function closeMarketItem(uint256 id)
+        external
+        nonReentrant
+        isPaused
     {
-        require(
-            id < marketItems.length,
-            "Marketplace::Not a market item!"
-        );
 
         MarketItem storage _item = marketItems[id];
 
-        require(
-            msg.sender == _item.seller,
-            "Marketplace::You are not the owner of this item!"
-        );
+        bool _valid = _validateLength(id) &&
+            _validateOwner(msg.sender, _item.seller) &&
+            _validateSold(_item.flags) &&
+            _validateClosed(_item.flags) &&
+            !_validateOpenForBids(_item.flags);
 
-        require(
-            !_item.sold,
-            "Marketplace::Item already sold!"
-        );
+        if(_valid == false) {
+            revert InvalidMarketItem(id);
+        }
 
-        require(
-            !_item.openForBids,
-            "Marketplace::End the auction first!"
-        );
-
-        require(
-            !_item.closed,
-            "Marketplace::Not on sale anymore!"
-        );
-
-        _item.closed = true;
+        _item.flags |= CLOSED_FLAG;
 
         IERC721(_item.collection).transferFrom(
             address(this),
             msg.sender,
-            id
+            _item.nftId
         );
 
         emit CloseMarketItem(id);
     }
+
+
+    function changePrice(uint256 id, uint256 newPrice)
+        external
+        nonReentrant
+        isPaused
+    {
+
+        MarketItem storage _item = marketItems[id];
+
+        bool _valid = _validateLength(id) &&
+            _validateOwner(msg.sender, _item.seller)&&
+            _validateSold(_item.flags) &&
+            _validateClosed(_item.flags);
+
+        if(_valid == false) {
+            revert InvalidMarketItem(id);
+        }
+
+        _item.price = newPrice;
+    }
+
 
     /**
      * @dev Function to create an auction for a listed a market item (NFT).
      * @param id The id of the market item.
      * @param periodInDays For how many days the auction will be open (starting from now)?
      */
-    function createAuction(
-        uint256 id,
-        uint256 periodInDays
-    )
-    external
-    nonReentrant
-    isPaused
+    function createAuction(uint256 id, uint256 periodInDays)
+        external
+        nonReentrant
+        isPaused
     {
-        require(
-            id < marketItems.length,
-            "Marketplace::Not a market item!"
-        );
+        MarketItem storage _item = marketItems[id];
 
         uint256 _periodInDays = block.timestamp + (periodInDays * 1 days);
 
-        MarketItem storage _item = marketItems[id];
+        bool _valid = _validateLength(id) &&
+            _validateOwner(msg.sender, _item.seller) &&
+            _validateSold(_item.flags) &&
+            !_validateOpenForBids(_item.flags) &&
+            _validateClosed(_item.flags);
 
-        require(
-            msg.sender == _item.seller,
-            "Marketplace::You are not the owner of this item!"
-        );
+        if(_valid == false) {
+            revert InvalidMarketItem(id);
+        }
 
-        require(
-            !_item.sold,
-            "Marketplace::Item already sold!"
-        );
-
-        require(
-            !_item.openForBids,
-            "Marketplace::Item already on auction!"
-        );
-
-        require(
-            !_item.closed,
-            "Marketplace::Not on sale anymore!"
-        );
-
-        _item.openForBids = true;
+        _item.flags |= OPEN_FOR_BIDS_FLAG;
 
         unchecked {
             _item.bidEndDate += _periodInDays;
@@ -356,90 +410,65 @@ contract NFT_MarketPlace is Initializable, OwnableUpgradeable, ReentrancyGuardUp
         emit CreateAuction(id, periodInDays);
     }
 
+
     /**
      * @dev Function to extend the auction period for a market item.
      * @param id The id of the market item.
      * @param extendPeriodInDays With how many days do we want to extend the period?
      */
-    function extendBidTime(
-        uint256 id,
-        uint256 extendPeriodInDays
-    )
+function extendBidTime(uint256 id, uint256 extendPeriodInDays)
     external
     nonReentrant
     isPaused
-    {
-        require(
-            id < marketItems.length,
-            "Marketplace::Not a market item!"
-        );
+{
 
-        uint256 _extendPeriodInDays = extendPeriodInDays * 1 days;
+    MarketItem storage _item = marketItems[id];
+    uint256 _extendPeriodInDays = extendPeriodInDays * 1 days;
 
-        MarketItem storage _item = marketItems[id];
+    bool _valid = _validateLength(id) &&
+        _validateOwner(msg.sender, _item.seller) &&
+        _validateSold(_item.flags) &&
+        _validateOpenForBids(_item.flags) &&
+        _validateClosed(_item.flags);
 
-        require(
-            msg.sender == _item.seller,
-            "Marketplace::You are not the owner of this item!"
-        );
-
-        require(
-            !_item.sold,
-            "Marketplace::Item already sold!"
-        );
-
-        require(
-            _item.openForBids,
-            "Marketplace::Item is not on auction!"
-        );
-
-        require(
-            !_item.closed,
-            "Marketplace::Not on sale anymore!"
-        );
-
-        if (block.timestamp < _item.bidEndDate) {
-            unchecked {
-                _item.bidEndDate += _extendPeriodInDays;
-            }
-        } else if (block.timestamp >= _item.bidEndDate) {
-            unchecked {
-                _item.bidEndDate += (block.timestamp + _extendPeriodInDays);
-            }
-        }
-
-        emit ExtendAuction(id, extendPeriodInDays);
+    if(_valid == false) {
+        revert InvalidMarketItem(id);
     }
+
+    if (block.timestamp < _item.bidEndDate) {
+        unchecked {
+            _item.bidEndDate += _extendPeriodInDays;
+        }
+    } else if (block.timestamp >= _item.bidEndDate) {
+        unchecked {
+            _item.bidEndDate = block.timestamp + _extendPeriodInDays;
+        }
+    }
+
+    emit ExtendAuction(id, extendPeriodInDays);
+}
+
 
     /**
      * @dev Function to close the auction for a market item.
      * @param id The id of the market item.
      */
-    function closeBidding(
-        uint256 id
-    )
-    external
-    nonReentrant
-    isPaused
+    function closeBidding(uint256 id)
+        external
+        nonReentrant
+        isPaused
     {
-        require(
-            id < marketItems.length,
-            "Marketplace::Not a market item!"
-        );
-
         MarketItem storage _item = marketItems[id];
 
-        require(
-            msg.sender == _item.seller,
-            "Marketplace::Not item owner!"
-        );
+        bool _valid = _validateLength(id) &&
+            _validateOwner(msg.sender, _item.seller) &&
+            _validateOpenForBids(_item.flags);
 
-        require(
-            _item.openForBids,
-            "Marketplace::Item not opened to auction!"
-        );
+        if(_valid == false) {
+            revert InvalidMarketItem(id);
+        }
         
-        _item.openForBids = false;
+        _item.flags &= ~OPEN_FOR_BIDS_FLAG;
 
         emit CloseAuction(id);
     }
@@ -459,30 +488,19 @@ contract NFT_MarketPlace is Initializable, OwnableUpgradeable, ReentrancyGuardUp
     onlyBidSettings
     isPaused
     {
-        require(
-            id < marketItems.length,
-            "Marketplace::Not a market item!"
-        );
-
         MarketItem storage _item = marketItems[id];
 
-        require(
-            _item.openForBids,
-            "Marketplace::Item not opened to auction!"
-        );
+        bool _valid = _validateLength(id) &&
+            _validateSold(_item.flags) &&
+            _validateClosed(_item.flags) &&
+            _validateOpenForBids(_item.flags);
 
-        require(
-            !_item.sold,
-            "Marketplace::Item already sold!"
-        );
+        if(_valid == false) {
+            revert InvalidMarketItem(id);
+        }
 
-        require(
-            !_item.closed,
-            "Marketplace::Item closed!"
-        );
-
-        _item.openForBids = false;
-        _item.sold = true;
+        _item.flags &= ~OPEN_FOR_BIDS_FLAG;
+        _item.flags |= SOLD_FLAG;
 
         IERC721(_item.collection).transferFrom(
             address(this),
@@ -492,6 +510,7 @@ contract NFT_MarketPlace is Initializable, OwnableUpgradeable, ReentrancyGuardUp
 
         emit AcceptBidForMarketItem(id);
     }
+
 
     /** Receive ETH */
     /**
@@ -530,17 +549,22 @@ contract NFT_MarketPlace is Initializable, OwnableUpgradeable, ReentrancyGuardUp
     {
         MarketItem memory _item = marketItems[id];
 
+        bool openForBids = (_item.flags & OPEN_FOR_BIDS_FLAG) != 0;
+        bool closed = (_item.flags & CLOSED_FLAG) != 0;
+        bool sold = (_item.flags & SOLD_FLAG) != 0;
+
         return(
             _item.nftId,
             _item.price,
             _item.bidEndDate,
             _item.seller,
             _item.collection,
-            _item.openForBids,
-            _item.closed,
-            _item.sold
+            openForBids,
+            closed,
+            sold
         );
     }
+
 
     /**
      * @dev Function to return the number of listed NFTs of a user.
@@ -578,20 +602,92 @@ contract NFT_MarketPlace is Initializable, OwnableUpgradeable, ReentrancyGuardUp
     /** INTERNAL FUNCTIONS */
     /**
      * @dev Function to send ETH in a safe manner.
-     * @param amount The amount in wei.
-     * @param receiver The receiver's address.
+     * @param _amount The amount in wei.
+     * @param _receiver The receiver's address.
      */
-    function safeSendPayment(
-        uint256 amount,
-        address receiver
+    function _safeSendPayment(
+        uint256 _amount,
+        address _receiver
     )
     internal
     {
-        (bool _sent, ) = receiver.call{value: amount}("");
+        (bool _sent, ) = _receiver.call{value: _amount}("");
         
+        if(_sent == false) {
+            revert NotEnoughFunds(_amount);
+        }
+    }
+
+    /**
+     * @dev Function to check if a collection supports the ERC2981 interface.
+     * @param _contract The address of the collection.
+     */
+    function _checkRoyalties(address _contract) internal view returns (bool) {
+        (bool success) = IERC165(_contract).supportsInterface(_INTERFACE_ID_ERC2981);
+        return success;
+    }
+
+    /**
+     * @dev Function to validate the owner of a market item.
+     * @param _caller The caller of the function.
+     * @param _owner The owner of the market item.
+     */
+    function _validateOwner(address _caller, address _owner) internal pure returns(bool) {
+        return _caller == _owner;
+    }
+
+    /**
+     * @dev Function to validate the length of the market items array.
+     */
+    function _validateLength(uint256 _length) internal view returns(bool) {
         require(
-            _sent,
-            "Marketplace::Can't transfer ETH!"
+            _length < marketItems.length,
+            "Marketplace::Length must be greater than zero!"
         );
+
+        return true;
+    }
+
+    /**
+     * @dev Function to validate the sold flag.
+     */
+    function _validateSold(uint8 _flags) internal pure returns(bool) {
+        if((_flags & SOLD_FLAG) == 0) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @dev Function to validate the closed flag.
+     */
+    function _validateClosed(uint8 _flags) internal pure returns(bool) {
+        if((_flags & CLOSED_FLAG) == 0) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @dev Function to validate the openForBids flag.
+     */
+    function _validateOpenForBids(uint8 _flags) internal pure returns(bool) {
+        if((_flags & OPEN_FOR_BIDS_FLAG) != 0) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @dev Function to validate an address.
+     */
+    function _validateAddress(address _addr) internal pure returns(bool) {
+        bool _valid = _addr != address(0) &&
+            _addr != address(0xdead);
+
+        return _valid;
     }
 }
