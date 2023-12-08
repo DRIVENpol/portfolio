@@ -44,13 +44,6 @@ event EmergencyWithdraw:
     user: indexed(address)
     amount: uint256
 
-# Function to compute pending rewards based on elapsed days
-@internal
-@view
-def _computePendingRewards(_user: address) -> uint256:
-    elapsedDays: uint256 = (block.timestamp - self.stakeDate[_user]) / 86400
-    return elapsedDays * self.rewardsPerDay * self.stakedByUser[_user]
-
 # Constructor
 @external
 def __init__(_emergencyFee: uint256, _rewardsPerDay: uint256, _tokenToStake: ERC20, _rewardToken: ERC20):
@@ -60,6 +53,13 @@ def __init__(_emergencyFee: uint256, _rewardsPerDay: uint256, _tokenToStake: ERC
     self.rewardsPerDay = _rewardsPerDay
 
     self.isPaused = False
+
+# Function to compute pending rewards based on elapsed days
+@internal
+@view
+def _computePendingRewards(_user: address) -> uint256:
+    elapsedDays: uint256 = (block.timestamp - self.stakeDate[_user]) / 86400
+    return elapsedDays * self.rewardsPerDay * self.stakedByUser[_user]
 
 # Function to stake tokens 
 @external
