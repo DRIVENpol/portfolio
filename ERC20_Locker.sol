@@ -1,407 +1,445 @@
-//SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
 
+import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-/// @title ERC20 Locker
-/// @notice Custom made smart contract to lock ERC20 tokens
-/// @author Socarde Paul
+/*
+* @note Liquidity Locker / ERC20 Token Locker Created
+* @author Paul Socarde
+*/                                     
 
+contract Rev3al_Locker is ReentrancyGuard {
+    /**
+     * 'paused' and 'owner' can be packed in a single slot
+     * (uint64 + address = 64 + 160 = 224 bits = 28 bytes) out of 32.
+     */
+    uint64 private paused; // Slot v | 1 = paused AND 2 = unpaused
+    address private owner; // Slot v
 
-/// Solidity version
-pragma solidity ^0.8.0;
+    address private pendingOwner; // Slot w;
 
-/// Imports
-import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+    /** Lock Fee
+     * lockFee (uint128) can be packed with lockId (uint128) in a single slot (uint256)
+     */
+    uint128 private lockFee; // Slot x | Max value: uint128(-1) = 340282366920938463463374607431768211455 = 340,282,366,920,938,463,463 eth
+    uint128 private lockId; // Slot x  | Max value: uint128(-1) = 340282366920938463463374607431768211455 = 340,282,366,920,938,463,463 eth
 
-/// ERC20 Interface
-interface IToken {
-    function balanceOf(address account) external view returns (uint256);
-    function transfer(address to, uint256 amount) external returns (bool);
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
-}
+    struct LockInfo {
+        /**
+         * 'lockTime' and 'token' can be packed in a single slot
+         * (uint64 + address = 64 + 160 = 224 bits = 28 bytes) out of 32.
+         */
+        address token; // Slot y
+        uint64 lockTime; // Slot y
 
-/// The Smart Contract
-contract LockerV3 is Initializable, OwnableUpgradeable, UUPSUpgradeable {
+        /**
+         * 'amount' and 'locked' can be packed in a single slot
+         * (uint128 + uint128 = 128 + 128 = 256 bits = 32 bytes) out of 32.
+         */
+        uint128 amount; // Slot z | Max value: uint128(-1) = 340282366920938463463374607431768211455 = 340,282,366,920,938,463,463 eth
+        uint128 locked; // Slot z | 1 - Locked AND 0 - Unlocked | Max value: uint128(-1) = 340282366920938463463374607431768211455 = 340,282,366,920,938,463,463 eth
 
-    /// Variables for coin fees
-    uint256 public lockFee;
-    uint256 public extendLockFee;
-    uint256 public totalFeesForRefferals;
-
-    /// Variables for token fees
-    address public token;
-    uint256 public lockFeeVo;
-    uint256 public extendLockFeeVo;
-    uint256 public totalFeesForRefferalsVo;
-
-    /// Pay in coins or tokens
-    bool public payInTokens;
-
-    /// Mapp locks to token address & owner address
-    mapping(address => uint256[]) public tokenToLocks;
-    mapping(address => uint256[]) public ownerToLocks;
-
-    /// Keep track of bonuses
-    mapping(address => uint256) public refferalRewards;
-    mapping(address => uint256) public refferalRewardsVo;
-
-    /// Check if a deposit pinged for support
-    mapping(uint256 => bool) public depositPinged;
-
-    /// Struct for lock
-    struct Lock {
-        uint256 amount; // Amount to lock
-        uint256 expirationDate; // Expiration time in days
-        address owner; // The owner of the lock
-        address tokenAddress; // The token that will be locked
+        address owner; // 160 bits = 20 bytes
     }
 
-    /// Array of locks
-    Lock[] public locks;
+    /**
+     * Id => LockInfo
+     * We don't use an array here to avoid length checks.
+     */
+    mapping(uint128 => LockInfo) public locks;
 
-    /// Single error to reduce gas
-    error Issue();
+    /** User => local id */
+    mapping(address => uint128) public userId;
 
-    /// Events
-    event EmergencyPing(uint256 lockId);
-    event Unlock(uint256 lockId, uint256 amount);
-    event ExtendLock(uint256 lockId, uint256 period);
-    event NewLock(address indexed token, uint256 amount);
-    event WithdrawRefferalBonus(address indexed refferal, uint256 amount);
-    event WithdrawRefferalBonusVO(address indexed refferal, uint256 amount);
+    /** Token => local id */
+    mapping(address => uint128) public tokenId;
 
-    /// Constructor
-    constructor() {
-        _disableInitializers();
+    /** User => local id => token lock */
+    mapping(address => mapping(uint128 => uint128)) public userLock;
+
+    /** Token => local id => token lock */
+    mapping(address => mapping(uint128 => uint128)) public tokenLock;
+
+    /** Token => total locked for token */
+    mapping(address => uint128) public totalLocked;
+
+    /** EMERGENCY WITHDRAWAL 
+     * Users requiring early token withdrawal can notify the contract.
+     * Proof of their community announcement regarding the intent to withdraw off-chain is mandatory.
+     * Upon contract notification, we will initiate the transfer of locked tokens to their address.
+     */
+    mapping(uint128 => uint8) public pinged;
+
+    /** Events */
+    event Pinged(uint128 indexed lockId);
+    event SetPendingAdmin(address indexed admin);
+    event LockFeeChanged(uint128 indexed newLockFee);
+    event Unlock(uint128 indexed lockId, address indexed token, uint128 amount);
+    event NewLock(address indexed owner, uint128 indexed lockId, address indexed token, uint128 amount, uint64 lockTime);
+
+    /** Errors */
+    error NotOwner();
+    error FeeNotPaid();
+    error CantUnlock();
+    error OutOfRange();
+    error InvalidAmount();
+    error InvalidAddress();
+    error ContractPaused();
+    error NotPendingOwner();
+    error InvalidLockTime();
+
+    /** Modifiers */
+    modifier onlyOwner() {
+        if(msg.sender != owner) revert NotOwner();
+        _;
     }
 
-    /// Initialize
-    function initialize() initializer public {
-        __Ownable_init();
-        __UUPSUpgradeable_init();
-
-        lockFee = 1 ether;
-        extendLockFee = 1 ether;
+    modifier isPaused() {
+        if(paused == 1) revert ContractPaused();
+        _;
     }
 
-    /// Authorize upgrade (UUPS specific)
-    function _authorizeUpgrade(address newImplementation)
-        internal
-        onlyOwner
-        override
-    {}
+    /** Constructor 
+     * @dev We make the constructor payable to reduce the gas fees;
+     */
+    constructor(uint128 _lockFee, address _owner) payable {
+        isValidAddress(_owner);
 
-    /// Allow the smart contract to receive coins
+        owner = _owner;
+
+        lockFee = _lockFee;
+        paused = 2; // Unpaused
+    }
+
+    /** Receive function */
     receive() external payable {}
 
-    /// @dev Function to create an ERC20 lock.
-    /// @param tokenAddress The token that will be locked.
-    /// @param amount The amount of tokens to be locked.
-    /// @param lockPeriod Lock period in days.
-    /// @param refferal Refferal that will receive 10% of a transaction if somebody is recommendit it.
-    function createErc20Lock(
-        address tokenAddress, 
-        uint256 amount, 
-        uint256 lockPeriod,
-        address refferal
-        ) external  payable {
-        /// The caller can't use his own address as refferal
-        if(refferal == msg.sender) revert Issue();
+    /** Owner Functions */
+    function transferOwnership(address _pendingOwner) external payable onlyOwner {
+        isValidAddress(_pendingOwner);
+        pendingOwner = _pendingOwner;
 
-        /// Token address should not be zero
-        if(tokenAddress == address(0)) revert Issue();
+        emit SetPendingAdmin(_pendingOwner);
+    }
 
-        /// The amount to lock should not be zero
-        if(amount == 0) revert Issue();
-
-        /// The lock period should not be zero
-        if(lockPeriod == 0) revert Issue();
-
-        /// If users needs to pay in ERC20 tokens
-        if(payInTokens == true) {
-         /// Msg.value should be zero
-         if(msg.value != 0) revert Issue();
-
-          /// We transfer the tokens from msg.sender to the smart contract
-          if(IToken(token).transferFrom(msg.sender, address(this), lockFeeVo) != true) revert Issue();
-           
-           /// If the caller recommend a refferal
-           if(refferal != address(0)) {
-                /// We mark the bonus in tokens for this refferal
-                _addBonusToRefferalVo(refferal, lockFeeVo / 10);
-            }
-        } else if(payInTokens == false){
-           /// If we take the fee in coins
-           /// Msg.value should be > fee
-           if(msg.value < lockFee) revert Issue();
-
-             /// If the caller recommend a refferal
-             if(refferal != address(0)) {
-
-                /// We mark the bonus in coins for this refferal
-                _addBonusToRefferal(refferal, lockFee / 10);
-            }
+    function acceptOwnership() external payable {
+        if(msg.sender != pendingOwner) {
+            revert NotPendingOwner();
         }
 
-        /// Transfer the tokens that needs to be locked to this smart contract
-        if(IToken(tokenAddress).transferFrom(msg.sender, address(this), amount) != true) revert Issue();
-
-        /// We push the lock id into the array of lock ids for this token
-        tokenToLocks[tokenAddress].push(locks.length);
-
-        /// We push the lock id into the array of lock ids of this owner
-        ownerToLocks[msg.sender].push(locks.length);
-
-        /// We create the lock
-        uint256 _lockPeriod = lockPeriod * 1 days;
-        locks.push(Lock(amount, block.timestamp +  _lockPeriod, msg.sender, tokenAddress));
-
-        emit NewLock(tokenAddress, amount);
+        owner = pendingOwner;
+        pendingOwner = address(0);
     }
 
-    /// @dev Function to extend an ERC20 lock.
-    /// @param lockId Which lock do you want to extend.
-    /// @param extendPeriod For how many days do you want to extend the lock.
-    /// @param refferal Refferal that will receive 10% of a transaction if somebody is recommendit it.
-    function extendLock(
-        uint256 lockId, 
-        uint256 extendPeriod,
-        address refferal
-        ) external payable {
-        /// The caller can't use his own address as refferal
-        if(refferal == msg.sender) revert Issue();
+    function changeLockFee(uint128 _lockFee) external payable onlyOwner {
+        lockFee = _lockFee;
 
-        /// The extend period should not be zero
-        if(extendPeriod == 0) revert Issue();
+        emit LockFeeChanged(_lockFee);
+    }
 
-        /// If users needs to pay in ERC20 tokens
-        if(payInTokens == true) {
-         /// Msg.value should be zero   
-         if(msg.value != 0) revert Issue();
+    function pause() external payable onlyOwner {
+        paused = 1; // Paused
+    }
 
-          /// We transfer the tokens from msg.sender to the smart contract
-          if(IToken(token).transferFrom(msg.sender, address(this), extendLockFeeVo) != true) revert Issue();
+    function unpause() external payable onlyOwner {
+        paused = 2; // Unpaused
+    }
 
-           /// If the caller recommend a refferal
-           if(refferal != address(0)) {
-                _addBonusToRefferalVo(refferal, extendLockFeeVo / 10);
-            }
-        } else if(payInTokens == false){
-           /// If we take the fee in coins
-           /// Msg.value should be > fee
-           if(msg.value < lockFee) revert Issue();
+    function withdrawERC20(address token) external payable onlyOwner {
+        // Check token balance
+        uint256 _balance = IERC20(token).balanceOf(address(this));
 
-             /// If the caller recommend a refferal
-             if(refferal != address(0)) {
+        // If token balanace > total locked, we can withdraw
+        uint256 _delta = _balance - uint256(totalLocked[token]);
 
-                /// We mark the bonus in coins for this refferal
-                _addBonusToRefferal(refferal, lockFee / 10);
-            }
+        if(_delta == 0) {
+            revert InvalidAmount();
         }
 
-        /// We access the storage for that lock
-        Lock storage _theLock = locks[lockId];
+        // The owner can withdraw only the extra amount of any ERC20 token OR 
+        // any ERC20 token that was sent by mistake to the smart contract
+        safeTransfer(token, msg.sender, _delta);
+    }
 
-        /// Revert if the msg.sender is not the owner
-        if(msg.sender != _theLock.owner) revert Issue();
-
-        /// Revert if there are no funds left in the lock
-        if(_theLock.amount == 0) revert Issue();
-
-        /// Compute the new lock period
-        uint256 _extendPeriod = extendPeriod * 1 days;
-
-        /// If the lock expired, the new extended time will be
-        /// time now + extend period
-        if(block.timestamp < _theLock.expirationDate) {
-            _theLock.expirationDate += _extendPeriod;
-        /// Otherwise, we extend the lock
-        } else if(block.timestamp >= _theLock.expirationDate){
-            uint256 _elapsedTime = block.timestamp - _theLock.expirationDate;
-            _theLock.expirationDate += _elapsedTime + _extendPeriod;
+    function withdrawFromPinged(uint128 _lockId, address _receiver) external payable onlyOwner {
+        if(_lockId >= lockId) {
+            revert OutOfRange();
         }
 
-        emit ExtendLock(lockId, _theLock.expirationDate);
+        if(pinged[_lockId] == 0) {
+            revert CantUnlock();
+        }
+
+        pinged[_lockId] = 1;
+
+        LockInfo storage _lock = locks[_lockId];
+
+        if(_lock.locked != 1) {
+            revert CantUnlock();
+        }
+
+        if(_lock.amount == 0) {
+            revert CantUnlock();
+        }
+
+        uint128 _amount = _lock.amount;
+
+        _lock.amount = 0;
+        _lock.locked = 2;
+
+        safeTransfer(_lock.token, _receiver, _amount);
+
+        unchecked {
+            totalLocked[_lock.token] -= _amount;
+        }
+
+        emit Unlock(lockId, _lock.token, _amount);
     }
 
-    /// @dev Function to withdraw tokens
-    /// @param lockId From which lock do we want to withdraw
-    function witdhrawTokens(uint256 lockId) external {
-        /// Access the lock in storage
-        Lock storage _theLock = locks[lockId];
-
-        /// Revert if the msg.sender is not the owner
-        if(msg.sender != _theLock.owner) revert Issue();
-
-        /// Revert if there are no funds left in the lock
-        if(_theLock.amount == 0) revert Issue();
-
-        /// Revert if the lock time is not elapsed
-        if(block.timestamp < _theLock.expirationDate) revert Issue();
-
-        /// Keep the amount of the lock in a local variable
-        uint256 _amount = _theLock.amount;
-
-        /// Modify the amount in the storage
-        _theLock.amount = 0;
-
-        /// Transfer the tokens to the owner
-        if(IToken(_theLock.tokenAddress).transfer(_theLock.owner, _amount) != true) revert Issue();
-
-        emit Unlock(lockId, _amount);
-    }
-
-    /// @dev Function for refferals to withdraw their bonuses in coins
-    function withdrawRefferalBonus() external {
-        uint256 _rewards = refferalRewards[msg.sender];
-        if(_rewards == 0) revert Issue();
-
-        refferalRewards[msg.sender] = 0;
-        totalFeesForRefferals -= _rewards;
-
-        _sendCoins(msg.sender, _rewards);
-
-        emit WithdrawRefferalBonus(msg.sender, _rewards);
-    }
-
-    /// @dev Function for refferals to withdraw their bonuses in tokens
-    function withdrawRefferalBonusVo() external {
-        uint256 _rewards = refferalRewardsVo[msg.sender];
-        if(_rewards == 0) revert Issue();
-
-        refferalRewardsVo[msg.sender] = 0;
-        totalFeesForRefferalsVo -= _rewards;
-
-        if(IToken(token).transfer(msg.sender, _rewards) != true) revert Issue();
-
-        emit WithdrawRefferalBonusVO(msg.sender, _rewards);
-    }
-
-    /// @dev Function to ask for support
-    /// @param lockId On which lock we need to take a look
-    function emergencyPing(uint256 lockId) external {
-        Lock memory _theLock = locks[lockId];
-        if(msg.sender != _theLock.owner) revert Issue();
-
-        depositPinged[lockId] = true;
-        emit EmergencyPing(lockId);
-    }
-
-    /// @dev Function to withdraw funds from a lock before the expiration date
-    /// Can be called only if the owner of the smart contract already pinged
-    function emergencyWithdrawFromLock(uint256 lockId, address newReceiver) external onlyOwner {
-        if(depositPinged[lockId] == false) revert Issue();
-        Lock storage _theLock = locks[lockId];
-
-        uint256 _amount = _theLock.amount;
-        _theLock.amount = 0;
-        depositPinged[lockId] = false;
-
-        if(IToken(_theLock.tokenAddress).transfer(newReceiver, _amount) != true) revert Issue();
-    }
-
-    /// @dev Only-owner function to withdraw the fees in coins
     function withdrawFees() external onlyOwner {
-        uint256 _fees = address(this).balance - totalFeesForRefferals;
-         _sendCoins(owner(), _fees);
+        safeTransferAllETH(owner);
     }
 
-    /// @dev Only-owner function to withdraw the fees in tokens
-    function withdrawVoFees() external onlyOwner {
-        uint256 _fees = IToken(token).balanceOf(address(this)) - totalFeesForRefferals;
-        if(IToken(token).transfer(owner(), _fees) != true) revert Issue();
-    }
-
-    /// @dev Only-owner function to change the payment option
-    function changePaymentMethod(bool option) external onlyOwner {
-        if(payInTokens == option) revert Issue();
-        if(option == true) {
-            if(token == address(0)) revert Issue();
+    /** User functions */
+    function lock(address token, uint128 amount, uint64 daysToLock) external payable isPaused nonReentrant {
+        if(msg.value != lockFee) {
+            revert("FeeNotPaid");
         }
-        payInTokens = option;
+
+        isValidAddress(address(token));
+
+        if(daysToLock < 1) {
+            revert InvalidLockTime();
+        }
+
+        if(daysToLock > 1825) { // 1825 days = 5 years | To avoid overflows
+            revert InvalidLockTime();
+        }
+
+        if(amount == 0) {
+            revert InvalidAmount();
+        }
+
+        // Check balance before
+        uint256 _balanceBefore = IERC20(token).balanceOf(address(this));
+
+        safeTransferFrom(token, msg.sender, address(this), amount);
+
+        // Check balance after
+        uint256 _balanceAfter = IERC20(token).balanceOf(address(this));
+
+        // Compute the delta to support tokens wiht transfer fees
+        uint256 _delta = _balanceAfter - _balanceBefore;
+
+        // Check if delta <= type(uint64).max | To avoid overflows
+        if(_delta > type(uint128).max) {
+            revert InvalidAmount();
+        }
+
+        // Check if delta > 0 | To avoid zero value locks
+        if(_delta == 0) {
+            revert InvalidAmount();
+        }
+
+        // Check if we can compute total tokens locked safely
+        if(uint256(totalLocked[address(token)]) + _delta > type(uint128).max) {
+            revert InvalidAmount();
+        }
+
+        LockInfo memory newLock = LockInfo({
+            token: address(token),
+            lockTime: uint64(block.timestamp + (daysToLock * 1 days)),
+            amount: uint128(_delta),
+            locked: 1,
+            owner: msg.sender
+        });
+
+        locks[lockId] = newLock;
+        userLock[msg.sender][userId[msg.sender]] = lockId;
+        tokenLock[address(token)][tokenId[address(token)]] = lockId;
+
+        unchecked {
+            ++lockId;
+            ++userId[msg.sender];
+            ++tokenId[address(token)];
+
+            totalLocked[address(token)] += uint128(_delta);
+        }
+
+        emit NewLock(msg.sender, lockId - 1, address(token), uint128(_delta), uint64(block.timestamp + (daysToLock * 1 days)));
     }
 
-    /// @dev Only-owner function to change all fees
-    function changeFees(
-        uint256 newLockFee,
-        uint256 newExtendLockFee,
-        uint256 newLockFeeVo,
-        uint256 newExtendLockFeeVo
-    ) external onlyOwner {
-        lockFee = newLockFee;
-        extendLockFee = newExtendLockFee;
-        lockFeeVo = newLockFeeVo;
-        extendLockFeeVo = newExtendLockFeeVo;
+    function unlock(uint128 _lockId) external payable isPaused nonReentrant {
+        if(_lockId >= lockId) {
+            revert OutOfRange();
+        }
+
+        LockInfo storage _lock = locks[_lockId];
+
+        if(_lock.locked != 1) {
+            revert CantUnlock();
+        }
+
+        if(_lock.owner != msg.sender) {
+            revert CantUnlock();
+        }
+
+        if(_lock.lockTime < uint64(block.timestamp)) {
+            revert CantUnlock();
+        }
+
+        if(_lock.amount == 0) {
+            revert CantUnlock();
+        }
+
+        uint128 _amount = _lock.amount;
+
+        _lock.amount = 0;
+        _lock.locked = 0;
+
+        safeTransfer(_lock.token, msg.sender, _amount);
+
+        unchecked {
+            totalLocked[_lock.token] -= _amount;
+        }
+
+        emit Unlock(lockId, _lock.token, _amount);
     }
 
-    /// @dev Only-owner function to change the token used for fees & rewards
-    function changeVoToken(address newVoToken) external onlyOwner {
-        token = newVoToken;
+    function pingContract(uint128 _lockId) external payable {
+        if(_lockId >= lockId) {
+            revert OutOfRange();
+        }
+
+        // We read from storag instead of memory because it's cheaper
+        // Read from storage => direct read
+        // Read from memory => read from storage + copy to memory
+        LockInfo storage _lock = locks[_lockId];
+
+        if(_lock.owner != msg.sender) {
+            revert NotOwner();
+        }
+
+        pinged[lockId] = 1;
+
+        emit Pinged(lockId);
     }
 
-    /// @dev Withdraw ERC20 tokens in case of emergency
-    function withdrawERC20tokens(address _token) external onlyOwner {
-        uint256 _balance = IToken(_token).balanceOf(address(this));
-        IToken(token).transfer(owner(), _balance);
+    /** Public view functions */
+    function getMyLocks(address _owner) public view returns(uint256[] memory lockIds) {
+        uint256 _length = userId[_owner];
+
+        lockIds = new uint256[](_length);
+
+        for(uint128 i = 0; i < _length; i++) {
+            lockIds[i] = userLock[_owner][i];
+        }
     }
 
-    /// @dev Withdraw coins in case of emergency
-    function withdrawCoins() external onlyOwner {
-        _sendCoins(owner(), address(this).balance);
+    function getTokenLocks(address _token) public view returns(uint256[] memory lockIds) {
+        uint256 _length = tokenId[_token];
+
+        lockIds = new uint256[](_length);
+
+        for(uint128 i = 0; i < _length; i++) {
+            lockIds[i] = tokenLock[_token][i];
+        }
     }
 
-    /// @dev Internal function to send coins
-    function _sendCoins(address to, uint256 amount) internal {
-        (bool _sent, ) = to.call{value: amount}("");
-        if(_sent == false) revert Issue();
+    function lockInfo(uint128 _lockId) public view returns(LockInfo memory) {
+        return locks[_lockId];
     }
 
-    /// @dev Internal function to link a refferal to his bonus in coins
-    function _addBonusToRefferal(address refferal, uint256 amount) internal {
-        refferalRewards[refferal] += amount;
-        totalFeesForRefferals += amount;
+    function getOwner() public view returns(address) {
+        return owner;
     }
 
-    /// @dev Internal function to link a refferal to his bonus in tokens
-    function _addBonusToRefferalVo(address refferal, uint256 amount) internal {
-        refferalRewardsVo[refferal] += amount;
-        totalFeesForRefferalsVo += amount;
+    function getPendingOwner() public view returns(address) {
+        return pendingOwner;
     }
 
-    /// @dev View function to get every lock that was made for a token
-    /// @return tokenToLocks[token] An array of ids
-    function getTokensToLocks(address _token) public view returns(uint256[] memory) {
-        return tokenToLocks[_token];
+    function fee() public view returns(uint128) {
+        return lockFee;
     }
 
-    /// @dev View function to get every lock that was made by a user
-    /// @return ownerToLocks[owner] An array of ids
-    function getOwnerToLocks(address owner) public view returns(uint256[] memory) {
-        return ownerToLocks[owner];
+    function getLockId() public view returns(uint128) {
+        return lockId;
     }
 
-    /// @dev View function to get the length of the locks array
-    /// @return locks.length Uint256
-    function getLocksLength() public view returns(uint256) {
-        return locks.length;
+    /** Internal functions */
+
+    /**
+     * IMPORTED FROM: https://github.com/Vectorized/solady/blob/main/src/utils/SafeTransferLib.sol
+     * NO ADDITIONAL EDITS HAVE BEEN MADE
+     */
+    function safeTransferFrom(address token, address from, address to, uint256 amount) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            let m := mload(0x40) // Cache the free memory pointer.
+            mstore(0x60, amount) // Store the `amount` argument.
+            mstore(0x40, to) // Store the `to` argument.
+            mstore(0x2c, shl(96, from)) // Store the `from` argument.
+            mstore(0x0c, 0x23b872dd000000000000000000000000) // `transferFrom(address,address,uint256)`.
+            // Perform the transfer, reverting upon failure.
+            if iszero(
+                and( // The arguments of `and` are evaluated from right to left.
+                    or(eq(mload(0x00), 1), iszero(returndatasize())), // Returned 1 or nothing.
+                    call(gas(), token, 0, 0x1c, 0x64, 0x00, 0x20)
+                )
+            ) {
+                mstore(0x00, 0x7939f424) // `TransferFromFailed()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x60, 0) // Restore the zero slot to zero.
+            mstore(0x40, m) // Restore the free memory pointer.
+        }
     }
 
-    /// @dev View function to return the bonuses of a refferal in coins
-    /// @return refferalRewards[refferal] Uint256
-    function getBonusesRefferal(address refferal) public view returns(uint256) {
-        return refferalRewards[refferal];
+    /**
+     * IMPORTED FROM: https://github.com/Vectorized/solady/blob/main/src/utils/SafeTransferLib.sol
+     * NO ADDITIONAL EDITS HAVE BEEN MADE
+     */
+    function safeTransfer(address token, address to, uint256 amount) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            mstore(0x14, to) // Store the `to` argument.
+            mstore(0x34, amount) // Store the `amount` argument.
+            mstore(0x00, 0xa9059cbb000000000000000000000000) // `transfer(address,uint256)`.
+            // Perform the transfer, reverting upon failure.
+            if iszero(
+                and( // The arguments of `and` are evaluated from right to left.
+                    or(eq(mload(0x00), 1), iszero(returndatasize())), // Returned 1 or nothing.
+                    call(gas(), token, 0, 0x10, 0x44, 0x00, 0x20)
+                )
+            ) {
+                mstore(0x00, 0x90b8ec18) // `TransferFailed()`.
+                revert(0x1c, 0x04)
+            }
+            mstore(0x34, 0) // Restore the part of the free memory pointer that was overwritten.
+        }
     }
 
-    /// @dev View function to return the bonuses of a refferal in tokens
-    /// @return refferalRewardsVo[refferal] Uint256
-    function getBonusesRefferalVo(address refferal) public view returns(uint256) {
-        return refferalRewardsVo[refferal];
+    /**
+     * IMPORTED FROM: https://github.com/Vectorized/solady/blob/main/src/utils/SafeTransferLib.sol
+     * NO ADDITIONAL EDITS HAVE BEEN MADE
+     */
+    /// @dev Sends all the ETH in the current contract to `to`.
+    function safeTransferAllETH(address to) internal {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // Transfer all the ETH and check if it succeeded or not.
+            if iszero(call(gas(), to, selfbalance(), codesize(), 0x00, codesize(), 0x00)) {
+                mstore(0x00, 0xb12d13eb) // `ETHTransferFailed()`.
+                revert(0x1c, 0x04)
+            }
+        }
     }
 
-    /// @dev View function to return lock @lockId
-    function getLockDetails(uint256 lockId) public view returns(Lock memory) {
-        return locks[lockId];
+    /** Pure functions */
+    function isValidAddress(address wallet) internal pure {
+        if (wallet == address(0) || wallet == address(0xdead)) {
+            revert InvalidAddress();
+        }
     }
-
 }
